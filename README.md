@@ -1,0 +1,198 @@
+# netcode-web
+
+HTTP routes for servers built on [quic-zig](https://github.com/endel/quic-zig):
+a router you embed in a server that already runs an event loop, a game
+server say, so its HTTP shares the port, the certificates and the loop.
+[netcode](https://github.com/endel/netcode) serves its HTTP with it.
+
+```zig
+const web = @import("web");
+
+const Game = struct {
+    scores: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+
+    fn score(game: *Game, ctx: *web.Context(.{ .params = struct { id: u64 } })) !u32 {
+        return game.scores.get(ctx.params.id) orelse error.NotFound;
+    }
+
+    fn submit(game: *Game, ctx: *web.Context(.{ .body = struct { id: u64, score: u32 } })) !void {
+        try game.scores.put(gpa, ctx.body.id, ctx.body.score);
+        try ctx.text(201, "saved\n");
+    }
+};
+
+var router: web.Router = .init(gpa);
+defer router.deinit();
+try router.get("/scores/:id", &game, Game.score);
+try router.post("/scores", &game, Game.submit);
+```
+
+## Using it
+
+Zig 0.17, and quic-zig checked out beside this one: `build.zig.zon` finds
+it at `../quic-zig`. The request API this builds on (`Exchange`,
+`Mailbox`) isn't on quic-zig's main yet.
+
+```zig
+// build.zig.zon
+.web = .{ .path = "../web" },
+
+// build.zig
+const web = b.dependency("web", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("web", web.module("web"));
+// Code shared with clients takes the contracts alone: std only.
+shared.addImport("endpoint", web.module("endpoint"));
+```
+
+## Handlers
+
+`fn (app: *App, ctx: *web.Context(spec)) !Result`, or without `app`.
+
+- `spec` says what the context decodes: `.params` (a field for each
+  `:name` of the pattern, checked at compile time), `.query` (fields with
+  defaults are optional) and `.body` (`[]const u8` as it came, any other
+  type from JSON). A param that doesn't parse makes the route not found;
+  a query or body that doesn't is 400.
+- A `Result` other than `void` is sent as JSON with 200. With `void` the
+  handler answers through `ctx` (`text`, `json`, `send`, `setHeader`);
+  one that doesn't gets 204.
+- An error answers with its status: `error.NotFound` 404, `error.Forbidden`
+  403, `error.BadRequest` 400… (`web.statusOf`); any other is 500, logged.
+  The first answer stands: one sent before the error isn't replaced.
+- Handlers run on the event loop's thread: they must not block.
+
+## Routes
+
+- `router.on(.PUT, pattern, app, handler)`, or `get` and `post` for short.
+  A method and path added twice is `error.DuplicateRoute`.
+- `router.scope(prefix)` puts routes under a prefix known at run time,
+  from a config file say: `router.scope(opts.api).get("/:id", ...)`.
+- `router.addAll(&other)` adds another router's routes.
+- Static segments win over params (`/items/new` before `/items/:id`), and a
+  path that leads nowhere one way tries the next. A known path with another
+  method is 405 with `Allow`; HEAD takes GET's route.
+- What no route has goes back to the server: static files, a 404.
+
+## Endpoints, declared once
+
+An endpoint's contract (method, path, what crosses it) can live in code a
+server and its clients share. `web.endpoint` imports nothing but std, so
+shared code built for the browser or a native client holds it too.
+
+```zig
+// shared.zig
+pub const Api = struct {
+    pub const top = web.endpoint.get("/scores/:game", .{
+        .params = struct { game: []const u8 },
+        .query = struct { limit: u8 = 10 },
+        .result = []const Score,
+    });
+};
+
+// server.zig: checked against the contract at compile time.
+fn top(game: *Game, ctx: *web.ContextOf(Api.top)) !Api.top.result { ... }
+try router.bind(Api.top, &game, top);
+```
+
+`web.endpoint.typescript.write(Api, writer, "game")` writes a client for
+them: `gameApi(base)` with a typed method per endpoint, its types as
+`gameApi.Score`, and `HttpError` for an answer other than 2xx. netcode's
+bindings write it beside a module's glue when its bindings file has
+`pub const http = Api;`.
+
+```ts
+const api = gameApi("https://game.example");
+const best = await api.top({ game: "tanks" }, { limit: 3 });
+```
+
+## Middleware
+
+A scope's `with` runs middleware around its routes: `before` at the
+request's head, ahead of its body (an answer there stops it), and `after`
+on every answer they send.
+
+```zig
+const auth: web.Bearer = .{ .token = opts.token };
+const cors: web.Cors = .{ .origins = &.{"https://game.example"} };
+const admin = try router.scope("/admin").with(&.{ auth.middleware(), cors.middleware(), web.access_log });
+try admin.get("/stats", app, stats);
+```
+
+- `web.Bearer`: `Authorization: Bearer <token>`, or 401.
+- `web.Cors`: listed origins read the answers, others get 403, and
+  preflights are answered. A known path answers OPTIONS with `Allow`.
+- `web.RateLimit`: a token bucket per client address, or 429.
+- `web.access_log`: a line per answer.
+
+A scope's `limit(n)` takes bodies up to `n` whatever its routes' `Spec`
+says, for a limit known at run time.
+
+## Work that blocks
+
+A handler runs on its event loop's thread. Work that takes longer goes to
+a `web.Pool`, and its result answers the request back on the loop:
+
+```zig
+fn upload(app: *App, ctx: *web.Context(.{ .body = []const u8, .max_body = 8 << 20 })) !void {
+    try ctx.offload(app.compiler, compile, .{ app, ctx.body });
+}
+```
+
+What `compile` returns answers it: a `web.Reply` as it is, anything else as
+JSON, an error with its status. A full pool is 503. The answer comes back
+through the loop's `quic.Mailbox`, which a server stopping waits for.
+
+## A listener of its own
+
+`web.Server` serves a router on an HTTP/1.1 listener of its own, with a
+thread and loop of its own: a control or admin port beside a game's.
+
+```zig
+const admin = try web.Server.create(gpa, &router, .{ .address = "127.0.0.1", .port = 4480 });
+defer admin.destroy();
+```
+
+## On quic-zig
+
+The handler of a quic-zig server passes its request callbacks on to a
+`web.quic.Host`, and the routes answer over HTTP/1.1 and HTTP/3 alike:
+
+```zig
+host: web.quic.Host, // .init(gpa, &router)
+
+pub fn onHttpHead(self: *App, ex: *quic.event_loop.Exchange) void {
+    self.host.onHttpHead(ex);
+}
+pub fn onHttpBody(self: *App, ex: *quic.event_loop.Exchange, data: []const u8) void {
+    self.host.onHttpBody(ex, data);
+}
+pub fn onHttpEnd(self: *App, ex: *quic.event_loop.Exchange) void {
+    self.host.onHttpEnd(ex);
+}
+pub fn onHttpGone(self: *App, ex: *quic.event_loop.Exchange) void {
+    self.host.onHttpGone(ex);
+}
+```
+
+A request gets an arena of its own, freed once it's answered. Its body,
+sized or chunked, is gathered before the handler runs, up to the route's
+`.max_body` (64 KiB unless its `Spec` says more); past that it's 413.
+
+## Tests
+
+`web.testing.Client` calls a router's routes through the same `Host` a
+server runs, limits included, without a socket:
+
+```zig
+var client: web.testing.Client = .init(std.testing.allocator, &router);
+defer client.deinit();
+try std.testing.expectEqual(404, (try client.get("/scores/7")).status);
+```
+
+`web.testing.Http3` sends one request over HTTP/3 to a server in the
+test. `zig build test` runs the package's own, real quic-zig servers'
+among them.
+
+## License
+
+MIT

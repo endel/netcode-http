@@ -1,0 +1,16 @@
+.{
+    .name = .web,
+    .version = "0.1.0",
+    .fingerprint = 0x15c93851ca88b8de,
+    .dependencies = .{
+        .quic = .{ .path = "../quic-zig" },
+    },
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
