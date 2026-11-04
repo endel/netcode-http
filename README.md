@@ -68,8 +68,11 @@ shared.addImport("endpoint", http.module("endpoint"));
 - `router.scope(prefix)` puts routes under a prefix known at run time,
   from a config file say: `router.scope(opts.api).get("/:id", ...)`.
 - `router.addAll(&other)` adds another router's routes.
-- Static segments win over params (`/items/new` before `/items/:id`), and a
-  path that leads nowhere one way tries the next. A known path with another
+- A last `*name` takes the rest of the path, slashes and all, as it came:
+  `/files/*path` has `/files/a/b%20c` with `path` `a/b%20c`, and `/files`
+  with it empty. Static segments win over params (`/items/new` before
+  `/items/:id`), params over a catch-all, and a path that leads nowhere
+  one way tries the next. A known path with another
   method is 405 with `Allow`; HEAD takes GET's route.
 - What no route has goes back to the server: static files, a 404.
 

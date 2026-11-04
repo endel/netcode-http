@@ -58,14 +58,15 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
     };
     const names = comptime endpoint.paramNames(pattern);
     endpoint.checkParams(pattern, names, Ctx.web_spec.params);
+    const rest = comptime endpoint.catchAll(pattern);
 
     const S = struct {
         fn run(app: ?*anyopaque, c: *const Call) anyerror!void {
             const arena = c.response.arena;
             var ctx: Ctx = .{
-                .params = try context.decodeParams(Ctx.web_spec.params, names, c.captures, arena),
-                .query = try context.decodeQuery(Ctx.web_spec.query, c.request.rawQuery(), arena),
-                .body = try context.decodeBody(Ctx.web_spec.body, c.request, arena),
+                .params = try endpoint.decodeParams(Ctx.web_spec.params, names, rest, c.captures, arena),
+                .query = try endpoint.decodeQuery(Ctx.web_spec.query, c.request.rawQuery(), arena),
+                .body = try endpoint.decodeBody(Ctx.web_spec.body, c.request.body, arena),
                 .request = c.request,
                 .response = c.response,
                 .arena = arena,
@@ -134,6 +135,8 @@ pub const Router = struct {
         segment: []const u8 = "",
         statics: std.ArrayList(*Node) = .empty,
         param: ?*Node = null,
+        /// `*name`'s: what's left of the path, whatever it holds.
+        rest: ?*Node = null,
         targets: std.EnumArray(Method, ?Target) = .initFill(null),
     };
 
@@ -182,12 +185,13 @@ pub const Router = struct {
     }
 
     fn child(a: std.mem.Allocator, node: *Node, seg: []const u8) !*Node {
-        if (seg[0] == ':') {
-            if (node.param == null) {
-                node.param = try a.create(Node);
-                node.param.?.* = .{};
+        if (seg[0] == ':' or seg[0] == '*') {
+            const slot = if (seg[0] == ':') &node.param else &node.rest;
+            if (slot.* == null) {
+                slot.* = try a.create(Node);
+                slot.*.?.* = .{};
             }
-            return node.param.?;
+            return slot.*.?;
         }
         for (node.statics.items) |c| if (std.mem.eql(u8, c.segment, seg)) return c;
         const c = try a.create(Node);
@@ -209,13 +213,13 @@ pub const Router = struct {
         return node.targets.get(method) orelse if (method == .HEAD) node.targets.get(.GET) else null;
     }
 
-    /// Static segments before params, trying the next way when one leads
-    /// nowhere; `segs` is copied for that.
+    /// Static segments before params, then a catch-all, trying the next
+    /// way when one leads nowhere; `segs` is copied for that.
     fn match(node: *const Node, segs: std.mem.TokenIterator(u8, .scalar), found: *Found) ?*const Node {
         var rest = segs;
         const seg = rest.next() orelse {
             for (node.targets.values) |t| if (t != null) return node;
-            return null;
+            return catchAll(node, segs, found);
         };
         for (node.statics.items) |c| if (std.mem.eql(u8, c.segment, seg)) {
             if (match(c, rest, found)) |f| return f;
@@ -226,7 +230,16 @@ pub const Router = struct {
             if (match(p, rest, found)) |f| return f;
             found.n -= 1;
         };
-        return null;
+        return catchAll(node, segs, found);
+    }
+
+    /// `node`'s catch-all, which takes `segs` on, empty or not.
+    fn catchAll(node: *const Node, segs: std.mem.TokenIterator(u8, .scalar), found: *Found) ?*const Node {
+        const r = node.rest orelse return null;
+        if (found.n == max_params) return null;
+        found.captures[found.n] = segs.rest();
+        found.n += 1;
+        return r;
     }
 
     /// 405, or 204 for OPTIONS, with the methods the path takes.

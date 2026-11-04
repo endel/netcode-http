@@ -166,6 +166,38 @@ test "a scope puts routes under a prefix known at run time; addAll copies, refus
     try std.testing.expectError(error.DuplicateRoute, copy.addAll(&r));
 }
 
+fn file(ctx: *http.Context(.{ .params = struct { path: []const u8 } })) ![]const u8 {
+    return ctx.params.path;
+}
+
+fn game(ctx: *http.Context(.{ .params = struct { kind: []const u8, rest: []const u8 } })) ![]const u8 {
+    return std.fmt.allocPrint(ctx.arena, "{s}:{s}", .{ ctx.params.kind, ctx.params.rest });
+}
+
+test "a catch-all takes the rest of the path as it came, after static segments and params" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.get("/files/*path", {}, file);
+    try r.get("/files/readme", {}, ping);
+    try r.get("/api/:kind/*rest", {}, game);
+    try r.on(.DELETE, "/api/:kind/*rest", {}, game);
+    try r.get("/api/tank/info", {}, ping);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+
+    try expectEqualStrings("\"a/b%20c/\"", (try c.get("/files/a/b%20c/")).body);
+    try expectEqualStrings("\"\"", (try c.get("/files")).body);
+    try expectEqualStrings("pong", (try c.get("/files/readme")).body);
+    try expectEqualStrings("\"readme/x\"", (try c.get("/files/readme/x")).body);
+    try expectEqualStrings("\"tank:scores/7\"", (try c.get("/api/tank/scores/7?x=1")).body);
+    try expectEqualStrings("pong", (try c.get("/api/tank/info")).body);
+    try expectEqualStrings("\"tank:info/more\"", (try c.get("/api/tank/info/more")).body);
+    const put = try c.request(.PUT, "/api/tank/a", .{});
+    try expectEqual(405, put.status.?);
+    try expectEqualStrings("GET, HEAD, DELETE", put.header("allow").?);
+    try expectEqual(null, (try c.get("/nowhere/a")).status);
+}
+
 const Score = struct { player: []const u8, points: u32 };
 const ScoreApi = struct {
     pub const top = http.endpoint.get("/scores/:game", .{ .params = struct { game: []const u8 }, .result = []const Score });

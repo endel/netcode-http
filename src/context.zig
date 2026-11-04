@@ -3,8 +3,8 @@
 const std = @import("std");
 const parser = @import("quic").http1.parser;
 const pool = @import("pool.zig");
-const Mailbox = @import("quic").Mailbox;
 const json_mod = @import("json.zig");
+const Mailbox = @import("quic").Mailbox;
 const Address = @import("address.zig").Address;
 
 const endpoint = @import("endpoint");
@@ -39,23 +39,7 @@ pub const Request = struct {
     }
 };
 
-/// The status an error from a handler answers with.
-pub fn statusOf(err: anyerror) u16 {
-    return switch (err) {
-        error.BadRequest => 400,
-        error.Unauthorized => 401,
-        error.Forbidden => 403,
-        error.NotFound => 404,
-        error.MethodNotAllowed => 405,
-        error.Conflict => 409,
-        error.Gone => 410,
-        error.PayloadTooLarge => 413,
-        error.UnsupportedMediaType => 415,
-        error.TooManyRequests => 429,
-        error.ServiceUnavailable => 503,
-        else => 500,
-    };
-}
+pub const statusOf = endpoint.statusOf;
 
 /// The answer, built in the request's arena. The first one sent stands.
 pub const Response = struct {
@@ -190,6 +174,9 @@ pub const Reply = struct {
     status: u16,
     content_type: []const u8 = "application/json",
     body: []const u8,
+    /// Each checked as `Response.setHeader` checks it: one that isn't a
+    /// valid field fails the answer with 500.
+    headers: []const Header = &.{},
 };
 
 fn Offload(comptime func: anytype) type {
@@ -216,7 +203,13 @@ fn Offload(comptime func: anytype) type {
                 .error_union => self.result catch |err| return res.fail(statusOf(err)),
                 else => self.result,
             };
-            if (@TypeOf(value) == Reply) return res.send(value.status, value.content_type, value.body) catch res.fail(500);
+            if (@TypeOf(value) == Reply) {
+                for (value.headers) |h| res.setHeader(h.name, h.value) catch {
+                    res.headers.clearRetainingCapacity();
+                    return res.fail(500);
+                };
+                return res.send(value.status, value.content_type, value.body) catch res.fail(500);
+            }
             if (@TypeOf(value) != void) res.json(200, value) catch res.fail(500);
         }
     };
@@ -226,92 +219,6 @@ pub fn isContext(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "web_spec");
 }
 
-/// `params`' fields from the pattern's captures, in the pattern's order.
-pub fn decodeParams(comptime P: type, comptime names: []const []const u8, captures: []const []const u8, arena: std.mem.Allocator) !P {
-    var p: P = undefined;
-    inline for (names, 0..) |name, i| {
-        const text = try percentDecode(arena, captures[i], false);
-        @field(p, name) = parseScalar(@FieldType(P, name), text) catch return error.NotFound;
-    }
-    return p;
-}
-
-/// One pass over `raw`'s pairs; a field takes the first value named for it.
-pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator) !Q {
-    const s = @typeInfo(Q).@"struct";
-    var q: Q = undefined;
-    var seen: [s.field_names.len]bool = @splat(false);
-    var it = std.mem.splitScalar(u8, raw, '&');
-    while (it.next()) |pair| {
-        if (pair.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
-        const key = try percentDecode(arena, pair[0..eq], true);
-        inline for (s.field_names, s.field_types, 0..) |name, T, i| {
-            if (!seen[i] and std.mem.eql(u8, key, name)) {
-                const value = try percentDecode(arena, if (eq < pair.len) pair[eq + 1 ..] else "", true);
-                @field(q, name) = parseScalar(T, value) catch return error.BadRequest;
-                seen[i] = true;
-            }
-        }
-    }
-    inline for (s.field_names, s.field_types, s.field_attrs, 0..) |name, T, attrs, i| {
-        if (!seen[i]) @field(q, name) = if (comptime attrs.defaultValue(T)) |d|
-            d
-        else if (@typeInfo(T) == .optional)
-            null
-        else
-            return error.BadRequest;
-    }
-    return q;
-}
-
-pub fn decodeBody(comptime B: type, req: *const Request, arena: std.mem.Allocator) !B {
-    if (B == void) return {};
-    if (B == []const u8) return req.body;
-    return std.json.parseFromSliceLeaky(B, arena, req.body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.BadRequest,
-    };
-}
-
-/// `%XX` decoded (a malformed one kept as it is), and `+` as a space in a query.
-fn percentDecode(arena: std.mem.Allocator, text: []const u8, plus_is_space: bool) ![]const u8 {
-    if (std.mem.indexOfAny(u8, text, if (plus_is_space) "%+" else "%") == null) return text;
-    const out = try arena.dupe(u8, text);
-    if (plus_is_space) std.mem.replaceScalar(u8, out, '+', ' ');
-    return std.Uri.percentDecodeInPlace(out);
-}
-
-fn parseScalar(comptime T: type, text: []const u8) !T {
-    if (T == []const u8) return text;
-    return switch (@typeInfo(T)) {
-        .int => std.fmt.parseInt(T, text, 10),
-        .float => std.fmt.parseFloat(T, text),
-        .bool => if (std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "1"))
-            true
-        else if (std.mem.eql(u8, text, "false") or std.mem.eql(u8, text, "0"))
-            false
-        else
-            error.InvalidCharacter,
-        .@"enum" => std.meta.stringToEnum(T, text) orelse error.InvalidCharacter,
-        .optional => |o| try parseScalar(o.child, text),
-        else => @compileError("a param or query field can't be " ++ @typeName(T)),
-    };
-}
-
-test "a query decodes into its fields, defaults and optionals filling the gaps" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const Q = struct { name: []const u8, limit: u32 = 10, mode: ?enum { fast, slow } = null, on: bool = false };
-    const q = try decodeQuery(Q, "name=ann+lee%21&on=1&extra=x&name=bob", arena.allocator());
-    try std.testing.expectEqualStrings("ann lee!", q.name);
-    try std.testing.expectEqual(10, q.limit);
-    try std.testing.expectEqual(null, q.mode);
-    try std.testing.expect(q.on);
-    try std.testing.expectError(error.BadRequest, decodeQuery(Q, "limit=3", arena.allocator()));
-    try std.testing.expectError(error.BadRequest, decodeQuery(Q, "name=a&limit=lots", arena.allocator()));
-    try std.testing.expectEqual(.slow, (try decodeQuery(Q, "name=a&mode=slow", arena.allocator())).mode.?);
-}
 
 test "a header that would split the head is refused" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
