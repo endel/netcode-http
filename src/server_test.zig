@@ -145,3 +145,32 @@ test "a rate limit turns a client away once its bucket is empty" {
     try expectEqual(429, third.status.?);
     try expectEqualStrings("1", third.header("retry-after").?);
 }
+
+fn whoAmI(ctx: *http.Context(.{})) !void {
+    const text = try std.fmt.allocPrint(ctx.arena, "{f}", .{ctx.request.client});
+    ctx.sendOwned(200, "text/plain", text);
+}
+
+test "behind a trusted proxy, each client it names has its own bucket; anyone else's header is ignored" {
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    var limit: http.RateLimit = .init(gpa, 0.001, 1);
+    defer limit.deinit();
+    try (try router.scope("").with(&.{limit.middleware()})).get("/me", {}, whoAmI);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+    const trusted = [_]http.address.Network{try .parse("10.0.0.0/8")};
+    c.host.trusted_proxies = &trusted;
+
+    const proxy = http.Address.parse("10.0.0.2").?;
+    const ann: []const http.Header = &.{.{ .name = "X-Forwarded-For", .value = "203.0.113.7" }};
+    const bob: []const http.Header = &.{.{ .name = "X-Forwarded-For", .value = "198.51.100.9" }};
+    const first = try c.request(.GET, "/me", .{ .peer = proxy, .headers = ann });
+    try expectEqualStrings("203.0.113.7", first.body);
+    try expectEqual(429, (try c.request(.GET, "/me", .{ .peer = proxy, .headers = ann })).status.?);
+    try expectEqual(200, (try c.request(.GET, "/me", .{ .peer = proxy, .headers = bob })).status.?);
+
+    // Not from the proxy: its own address, whatever it claims.
+    const stranger = try c.request(.GET, "/me", .{ .peer = http.Address.parse("192.0.2.1").?, .headers = bob });
+    try expectEqualStrings("192.0.2.1", stranger.body);
+}

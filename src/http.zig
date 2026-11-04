@@ -39,6 +39,9 @@ pub const Reply = context.Reply;
 /// The JSON answers are written in, for a body built by hand (`Reply`).
 pub const json = @import("json.zig");
 
+/// Client addresses, and the proxies trusted to name them.
+pub const address = @import("address.zig");
+pub const Address = address.Address;
 
 pub const Middleware = middleware.Middleware;
 pub const Bearer = middleware.Bearer;
@@ -58,6 +61,7 @@ pub const testing = @import("testing.zig");
 test {
     std.testing.refAllDecls(@This());
     _ = context;
+    _ = address;
     _ = @import("router_test.zig");
     _ = @import("e2e_test.zig");
     _ = @import("server_test.zig");

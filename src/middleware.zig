@@ -91,7 +91,8 @@ pub const Cors = struct {
     }
 };
 
-/// Requests per client address: `per_second` on average, `burst` at once;
+/// Requests per client address (`Request.client`, so behind a trusted proxy
+/// each client has its own): `per_second` on average, `burst` at once;
 /// past it, 429. GCRA, as routez's `limit_req`: each address keeps only
 /// when its bucket is next full. Any thread.
 pub const RateLimit = struct {
@@ -121,8 +122,7 @@ pub const RateLimit = struct {
 
     fn check(ctx: ?*const anyopaque, req: *const Request, res: *Response) void {
         const self: *RateLimit = @ptrCast(@alignCast(@constCast(ctx.?)));
-        const peer = req.peer orelse return;
-        if (self.take(addressKey(peer), sys.nanoTimestamp())) return;
+        if (self.take(req.client.bytes, sys.nanoTimestamp())) return;
         res.setHeader("Retry-After", "1") catch {};
         res.fail(429);
     }
@@ -143,30 +143,11 @@ pub const RateLimit = struct {
     }
 };
 
-/// The client's IP, IPv4 as IPv4-mapped IPv6.
-fn addressKey(peer: *const std.posix.sockaddr.storage) [16]u8 {
-    var key: [16]u8 = @splat(0);
-    switch (peer.family) {
-        std.posix.AF.INET => {
-            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(peer));
-            key[10] = 0xff;
-            key[11] = 0xff;
-            @memcpy(key[12..], std.mem.asBytes(&in.addr));
-        },
-        std.posix.AF.INET6 => {
-            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(peer));
-            key = in6.addr;
-        },
-        else => {},
-    }
-    return key;
-}
-
-/// A line per answer: method, target, status and body length.
+/// A line per answer: client, method, target, status and body length.
 pub const access_log: Middleware = .{ .after = logAnswer };
 
 fn logAnswer(_: ?*const anyopaque, req: *const Request, res: *Response) void {
-    std.log.scoped(.http).info("{t} {s} {d} {d}", .{ req.method, req.target, res.status, res.body.len });
+    std.log.scoped(.http).info("{f} {t} {s} {d} {d}", .{ req.client, req.method, req.target, res.status, res.body.len });
 }
 
 test "a bucket empties, refills with time, and each address has its own" {

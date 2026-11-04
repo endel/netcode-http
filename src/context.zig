@@ -5,6 +5,7 @@ const parser = @import("quic").http1.parser;
 const pool = @import("pool.zig");
 const Mailbox = @import("quic").Mailbox;
 const json_mod = @import("json.zig");
+const Address = @import("address.zig").Address;
 
 const endpoint = @import("endpoint");
 pub const Method = endpoint.Method;
@@ -18,8 +19,9 @@ pub const Request = struct {
     target: []const u8,
     headers: []const Header = &.{},
     body: []const u8 = "",
-    /// The peer; null when the transport has none (a Unix socket, a test).
-    peer: ?*const std.posix.sockaddr.storage = null,
+    /// Who sent it: the peer, or behind a trusted proxy the client it names
+    /// (`Host.trusted_proxies`).
+    client: Address = .{},
 
     pub fn path(self: *const Request) []const u8 {
         return self.target[0 .. std.mem.indexOfScalar(u8, self.target, '?') orelse self.target.len];

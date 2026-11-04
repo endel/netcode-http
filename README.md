@@ -122,7 +122,12 @@ try admin.get("/stats", app, stats);
 - `http.Cors`: listed origins read the answers, others get 403, and
   preflights are answered. A known path answers OPTIONS with `Allow`.
 - `http.RateLimit`: a token bucket per client address, or 429.
-- `http.access_log`: a line per answer.
+- `http.access_log`: a line per answer, the client's address first.
+
+Behind a proxy such as routez, list it in `trusted_proxies` (the `Host`'s,
+or `http.Server`'s option): a request from it is the client its
+`X-Forwarded-For` names, `Request.client`, which the rate limit and the
+log use. Anyone else's `X-Forwarded-For` is ignored.
 
 A scope's `limit(n)` takes bodies up to `n` whatever its routes' `Spec`
 says, for a limit known at run time.

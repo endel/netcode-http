@@ -11,6 +11,7 @@ const Exchange = @import("quic").event_loop.Exchange;
 const context = @import("context.zig");
 const router_mod = @import("router.zig");
 const Router = router_mod.Router;
+const address = @import("address.zig");
 
 /// A body of known length is reserved up to this much at its head.
 const eager_body = 1 << 20;
@@ -18,6 +19,10 @@ const eager_body = 1 << 20;
 pub const Host = struct {
     router: *const Router,
     gpa: std.mem.Allocator,
+    /// The proxies in front, such as routez: a request from one is the
+    /// client its `X-Forwarded-For` names (`Request.client`). List every
+    /// proxy on the way in, not just the nearest (`address.parseNetworks`).
+    trusted_proxies: []const address.Network = &.{},
 
     /// A request's own, from its head to its answer.
     const Pending = struct {
@@ -26,8 +31,6 @@ pub const Host = struct {
         ex: ?*Exchange,
         req: context.Request,
         res: context.Response,
-        /// The peer's, which a request answered later may outlive.
-        peer: std.posix.sockaddr.storage,
         found: router_mod.Found,
         body: std.ArrayList(u8) = .empty,
         content_length: ?u64,
@@ -43,12 +46,12 @@ pub const Host = struct {
         const head: context.Request = .{ .method = method, .target = ex.target, .headers = ex.headers };
         const found = self.router.find(&head) orelse return ex.pass();
         const p = self.gpa.create(Pending) catch return ex.abort();
-        p.* = .{ .arena = .init(self.gpa), .ex = ex, .req = head, .res = undefined, .peer = ex.peerAddress().*, .found = found, .content_length = ex.content_length };
+        p.* = .{ .arena = .init(self.gpa), .ex = ex, .req = head, .res = undefined, .found = found, .content_length = ex.content_length };
         const a = p.arena.allocator();
         p.res = .init(a);
         if (ex.mailbox) |m| p.res.late = .{ .ctx = p, .send = sendLater, .mailbox = m };
         p.req = copyHead(a, &head) catch return fail(p, 500);
-        p.req.peer = &p.peer;
+        p.req.client = address.clientOf(ex.peerAddress(), head.headers, self.trusted_proxies);
         p.found.rebase(head.target, p.req.target);
         ex.user_data = p;
         for (found.middleware()) |m| if (m.before) |before| {

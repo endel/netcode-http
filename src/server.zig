@@ -14,6 +14,7 @@ const http1 = quic.http1;
 const xev = quic.event_loop.Xev;
 const Router = @import("router.zig").Router;
 const Host = @import("quic.zig").Host;
+const address = @import("address.zig");
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -30,15 +31,20 @@ pub const Server = struct {
         port: u16 = 0,
         /// Connections served at once; the rest wait in the listen backlog.
         max_connections: u32 = 64,
+        /// `Host.trusted_proxies`: addresses, or networks as `"10.0.0.0/8"`.
+        /// `create` fails with `error.InvalidNetwork` on an entry that's neither.
+        trusted_proxies: []const []const u8 = &.{},
     };
 
     /// Binds, then serves from a thread of its own until `destroy`.
     pub fn create(gpa: std.mem.Allocator, router: *const Router, opts: Options) !*Server {
         const self = try gpa.create(Server);
         errdefer gpa.destroy(self);
+        const trusted = try address.parseNetworks(gpa, opts.trusted_proxies);
+        errdefer gpa.free(trusted);
         self.* = .{
             .gpa = gpa,
-            .host = .init(gpa, router),
+            .host = .{ .gpa = gpa, .router = router, .trusted_proxies = trusted },
             .loop = try xev.Loop.init(.{}),
             .http = undefined,
             .stop_wake = undefined,
@@ -67,6 +73,7 @@ pub const Server = struct {
         self.http.deinit();
         self.stop_wake.deinit();
         self.loop.deinit();
+        self.gpa.free(self.host.trusted_proxies);
         self.gpa.destroy(self);
     }
 

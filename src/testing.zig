@@ -15,6 +15,7 @@ const context = @import("context.zig");
 const Router = @import("router.zig").Router;
 const Host = @import("quic.zig").Host;
 const getHeader = quic.http1.parser.getHeader;
+const Address = @import("address.zig").Address;
 
 pub const Answer = struct {
     /// Null when no route had the path.
@@ -30,6 +31,8 @@ pub const Answer = struct {
 pub const Options = struct {
     headers: []const context.Header = &.{},
     body: []const u8 = "",
+    /// Who the connection is from: a proxy, say, with `Client.host.trusted_proxies`.
+    peer: Address = .{},
 };
 
 /// Answers live until `deinit`.
@@ -47,6 +50,8 @@ pub const Client = struct {
 
     pub fn request(self: *Client, method: context.Method, target: []const u8, opts: Options) !Answer {
         var fake: Fake = .{ .arena = self.arena.allocator() };
+        const in6: *std.posix.sockaddr.in6 = @ptrCast(@alignCast(&fake.address));
+        in6.* = .{ .port = 0, .flowinfo = 0, .addr = opts.peer.bytes, .scope_id = 0 };
         var ex: Exchange = .{
             .method = @tagName(method),
             .target = target,
