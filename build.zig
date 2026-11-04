@@ -8,8 +8,8 @@ pub fn build(b: *std.Build) void {
     // Endpoints' contracts, std only: shared code holds them whatever its
     // target, so the module takes its importer's.
     const endpoint = b.addModule("endpoint", .{ .root_source_file = b.path("src/endpoint.zig") });
-    const web = b.addModule("web", .{
-        .root_source_file = b.path("src/web.zig"),
+    const http = b.addModule("http", .{
+        .root_source_file = b.path("src/http.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run the tests");
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = web })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = http })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/endpoint.zig"),
         .target = target,

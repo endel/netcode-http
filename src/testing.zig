@@ -2,7 +2,7 @@
 //! `Host`, without a socket; and one HTTP/3 request against a real server.
 //!
 //! ```zig
-//! var client: web.testing.Client = .init(std.testing.allocator, &router);
+//! var client: http.testing.Client = .init(std.testing.allocator, &router);
 //! defer client.deinit();
 //! const res = try client.get("/rooms/tank");
 //! try std.testing.expectEqual(200, res.status);

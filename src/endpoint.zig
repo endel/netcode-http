@@ -5,7 +5,7 @@
 //!
 //! ```zig
 //! pub const Api = struct {
-//!     pub const score = web.endpoint.get("/scores/:game", .{
+//!     pub const score = http.endpoint.get("/scores/:game", .{
 //!         .params = struct { game: []const u8 },
 //!         .result = Score,
 //!     });

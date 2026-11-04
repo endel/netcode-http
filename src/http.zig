@@ -2,11 +2,11 @@
 //! runs an event loop (a game server, say) or to serve on their own.
 //!
 //! ```zig
-//! fn score(game: *Game, ctx: *web.Context(.{ .params = struct { id: u64 } })) !Score {
+//! fn score(game: *Game, ctx: *http.Context(.{ .params = struct { id: u64 } })) !Score {
 //!     return game.scores.get(ctx.params.id) orelse error.NotFound;
 //! }
 //!
-//! var router: web.Router = .init(gpa);
+//! var router: http.Router = .init(gpa);
 //! defer router.deinit();
 //! try router.get("/scores/:id", &game, score);
 //! ```

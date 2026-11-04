@@ -1,7 +1,7 @@
 .{
-    .name = .web,
+    .name = .http,
     .version = "0.1.0",
-    .fingerprint = 0x15c93851ca88b8de,
+    .fingerprint = 0x97780db217f6274d,
     .dependencies = .{
         .quic = .{ .path = "../quic-zig" },
     },

@@ -13,7 +13,7 @@ const Method = context.Method;
 const Request = context.Request;
 const Response = context.Response;
 
-const log = std.log.scoped(.web);
+const log = std.log.scoped(.http);
 
 pub const max_params = endpoint.max_params;
 
@@ -38,7 +38,7 @@ const Route = struct {
     max_body: usize,
 };
 
-/// `handler` is `fn (app: *App, ctx: *web.Context(spec)) !Result`, or
+/// `handler` is `fn (app: *App, ctx: *http.Context(spec)) !Result`, or
 /// without `app`. A `Result` other than `void` is sent as JSON with 200;
 /// with `void` the handler answers through `ctx`, and one that doesn't
 /// gets 204. An error answers with its status (`statusOf`) unless the
@@ -48,7 +48,7 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
     const ps = info.param_types;
     if (ps.len == 0 or ps.len > 2) @compileError(pattern ++ ": a handler takes its context, after its app's state if it has one");
     const Ctx = @typeInfo(ps[ps.len - 1] orelse @compileError(pattern ++ ": the context can't be anytype")).pointer.child;
-    if (!context.isContext(Ctx)) @compileError(pattern ++ ": a handler's last parameter is a *web.Context(...)");
+    if (!context.isContext(Ctx)) @compileError(pattern ++ ": a handler's last parameter is a *http.Context(...)");
     const App = if (ps.len == 2) ps[0].? else void;
     if (App != void and @typeInfo(App) != .pointer) @compileError(pattern ++ ": a handler's state is a pointer");
     const Returned = info.return_type.?;
@@ -306,11 +306,11 @@ pub const Scope = struct {
         return self.on(.POST, pattern, app, handler);
     }
 
-    /// `handler` as endpoint `e` (`web.endpoint`), checked against its
-    /// contract: the handler takes `*web.ContextOf(e)` and returns `e.result`.
+    /// `handler` as endpoint `e` (`http.endpoint`), checked against its
+    /// contract: the handler takes `*http.ContextOf(e)` and returns `e.result`.
     pub fn bind(self: Scope, comptime e: endpoint.Endpoint, app: anytype, comptime handler: anytype) !void {
         const r = comptime route(e.path, handler);
-        if (r.Ctx != ContextOf(e)) @compileError(e.path ++ ": a handler bound to it takes *web.ContextOf(its endpoint)");
+        if (r.Ctx != ContextOf(e)) @compileError(e.path ++ ": a handler bound to it takes *http.ContextOf(its endpoint)");
         if (r.Result != e.result) @compileError(e.path ++ ": its handler returns " ++ @typeName(r.Result) ++ ", not the endpoint's " ++ @typeName(e.result));
         return self.on(e.method, e.path, app, handler);
     }

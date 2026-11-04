@@ -4,7 +4,7 @@
 //! can wait; longer work goes to a `Pool`.
 //!
 //! ```zig
-//! const admin = try web.Server.create(gpa, &router, .{ .port = 4480 });
+//! const admin = try http.Server.create(gpa, &router, .{ .port = 4480 });
 //! defer admin.destroy();
 //! ```
 

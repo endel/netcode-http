@@ -3,26 +3,26 @@
 
 const std = @import("std");
 const quic = @import("quic");
-const web = @import("web.zig");
+const http = @import("http.zig");
 const sys = quic.sys;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const gpa = std.testing.allocator;
 
 const Admin = struct {
-    pool: *web.Pool,
-    full: *web.Pool,
+    pool: *http.Pool,
+    full: *http.Pool,
 
-    fn stats(_: *Admin, _: *web.Context(.{})) !struct { rooms: u32 } {
+    fn stats(_: *Admin, _: *http.Context(.{})) !struct { rooms: u32 } {
         return .{ .rooms = 3 };
     }
 
     /// Sums the body's bytes on a pool thread, as a compile would run.
-    fn sum(self: *Admin, ctx: *web.Context(.{ .body = []const u8, .max_body = 1 << 20 })) !void {
+    fn sum(self: *Admin, ctx: *http.Context(.{ .body = []const u8, .max_body = 1 << 20 })) !void {
         try ctx.offload(self.pool, add, .{ctx.body});
     }
 
-    fn crowded(self: *Admin, ctx: *web.Context(.{})) !void {
+    fn crowded(self: *Admin, ctx: *http.Context(.{})) !void {
         try ctx.offload(self.full, add, .{""});
     }
 
@@ -57,21 +57,21 @@ fn bodyOf(response: []const u8) []const u8 {
 }
 
 test "a listener of its own: a bearer token guards it, and offloaded work answers from the pool" {
-    const pool = try web.Pool.create(gpa, std.testing.io, .{ .threads = 2 });
+    const pool = try http.Pool.create(gpa, std.testing.io, .{ .threads = 2 });
     defer pool.destroy();
-    const full = try web.Pool.create(gpa, std.testing.io, .{ .max_queued = 0 });
+    const full = try http.Pool.create(gpa, std.testing.io, .{ .max_queued = 0 });
     defer full.destroy();
     var admin: Admin = .{ .pool = pool, .full = full };
 
-    var router: web.Router = .init(gpa);
+    var router: http.Router = .init(gpa);
     defer router.deinit();
-    const auth: web.Bearer = .{ .token = "s3cret" };
+    const auth: http.Bearer = .{ .token = "s3cret" };
     const guarded = try router.scope("").with(&.{auth.middleware()});
     try guarded.get("/stats", &admin, Admin.stats);
     try guarded.post("/sum", &admin, Admin.sum);
     try guarded.get("/crowded", &admin, Admin.crowded);
 
-    const server = try web.Server.create(gpa, &router, .{});
+    const server = try http.Server.create(gpa, &router, .{});
     defer server.destroy();
     var buf: [4096]u8 = undefined;
 
@@ -90,16 +90,16 @@ test "a listener of its own: a bearer token guards it, and offloaded work answer
     try std.testing.expect(std.mem.startsWith(u8, crowded, "HTTP/1.1 503 "));
 }
 
-fn hello(ctx: *web.Context(.{})) !void {
+fn hello(ctx: *http.Context(.{})) !void {
     try ctx.text(200, "hello");
 }
 
 test "CORS: a listed origin reads the answer, another is refused, a preflight is answered" {
-    var router: web.Router = .init(gpa);
+    var router: http.Router = .init(gpa);
     defer router.deinit();
-    const cors: web.Cors = .{ .origins = &.{"https://game.example"} };
+    const cors: http.Cors = .{ .origins = &.{"https://game.example"} };
     try (try router.scope("").with(&.{cors.middleware()})).post("/hello", {}, hello);
-    var c: web.testing.Client = .init(gpa, &router);
+    var c: http.testing.Client = .init(gpa, &router);
     defer c.deinit();
 
     const listed = try c.request(.POST, "/hello", .{ .headers = &.{.{ .name = "Origin", .value = "https://GAME.example" }} });
@@ -131,12 +131,12 @@ test "CORS: a listed origin reads the answer, another is refused, a preflight is
 }
 
 test "a rate limit turns a client away once its bucket is empty" {
-    var router: web.Router = .init(gpa);
+    var router: http.Router = .init(gpa);
     defer router.deinit();
-    var limit: web.RateLimit = .init(gpa, 0.001, 2);
+    var limit: http.RateLimit = .init(gpa, 0.001, 2);
     defer limit.deinit();
-    try (try router.scope("").with(&.{ limit.middleware(), web.access_log })).post("/hello", {}, hello);
-    var c: web.testing.Client = .init(gpa, &router);
+    try (try router.scope("").with(&.{ limit.middleware(), http.access_log })).post("/hello", {}, hello);
+    var c: http.testing.Client = .init(gpa, &router);
     defer c.deinit();
 
     try expectEqual(200, (try c.post("/hello", "")).status.?);

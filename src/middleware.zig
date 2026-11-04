@@ -3,7 +3,7 @@
 //! send, theirs or one a `before` sent.
 //!
 //! ```zig
-//! const auth: web.Bearer = .{ .token = opts.token };
+//! const auth: http.Bearer = .{ .token = opts.token };
 //! const admin = try router.scope("/admin").with(&.{auth.middleware()});
 //! try admin.get("/stats", app, stats);
 //! ```

@@ -1,4 +1,4 @@
-# netcode-web
+# netcode-http
 
 HTTP routes for servers built on [quic-zig](https://github.com/endel/quic-zig):
 a router you embed in a server that already runs an event loop, a game
@@ -6,22 +6,22 @@ server say, so its HTTP shares the port, the certificates and the loop.
 [netcode](https://github.com/endel/netcode) serves its HTTP with it.
 
 ```zig
-const web = @import("web");
+const http = @import("http");
 
 const Game = struct {
     scores: std.AutoHashMapUnmanaged(u64, u32) = .empty,
 
-    fn score(game: *Game, ctx: *web.Context(.{ .params = struct { id: u64 } })) !u32 {
+    fn score(game: *Game, ctx: *http.Context(.{ .params = struct { id: u64 } })) !u32 {
         return game.scores.get(ctx.params.id) orelse error.NotFound;
     }
 
-    fn submit(game: *Game, ctx: *web.Context(.{ .body = struct { id: u64, score: u32 } })) !void {
+    fn submit(game: *Game, ctx: *http.Context(.{ .body = struct { id: u64, score: u32 } })) !void {
         try game.scores.put(gpa, ctx.body.id, ctx.body.score);
         try ctx.text(201, "saved\n");
     }
 };
 
-var router: web.Router = .init(gpa);
+var router: http.Router = .init(gpa);
 defer router.deinit();
 try router.get("/scores/:id", &game, Game.score);
 try router.post("/scores", &game, Game.submit);
@@ -35,18 +35,18 @@ it at `../quic-zig`. The request API this builds on (`Exchange`,
 
 ```zig
 // build.zig.zon
-.web = .{ .path = "../web" },
+.http = .{ .path = "../http" },
 
 // build.zig
-const web = b.dependency("web", .{ .target = target, .optimize = optimize });
-exe.root_module.addImport("web", web.module("web"));
+const http = b.dependency("http", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("http", http.module("http"));
 // Code shared with clients takes the contracts alone: std only.
-shared.addImport("endpoint", web.module("endpoint"));
+shared.addImport("endpoint", http.module("endpoint"));
 ```
 
 ## Handlers
 
-`fn (app: *App, ctx: *web.Context(spec)) !Result`, or without `app`.
+`fn (app: *App, ctx: *http.Context(spec)) !Result`, or without `app`.
 
 - `spec` says what the context decodes: `.params` (a field for each
   `:name` of the pattern, checked at compile time), `.query` (fields with
@@ -57,7 +57,7 @@ shared.addImport("endpoint", web.module("endpoint"));
   handler answers through `ctx` (`text`, `json`, `send`, `setHeader`);
   one that doesn't gets 204.
 - An error answers with its status: `error.NotFound` 404, `error.Forbidden`
-  403, `error.BadRequest` 400… (`web.statusOf`); any other is 500, logged.
+  403, `error.BadRequest` 400… (`http.statusOf`); any other is 500, logged.
   The first answer stands: one sent before the error isn't replaced.
 - Handlers run on the event loop's thread: they must not block.
 
@@ -76,13 +76,13 @@ shared.addImport("endpoint", web.module("endpoint"));
 ## Endpoints, declared once
 
 An endpoint's contract (method, path, what crosses it) can live in code a
-server and its clients share. `web.endpoint` imports nothing but std, so
+server and its clients share. `http.endpoint` imports nothing but std, so
 shared code built for the browser or a native client holds it too.
 
 ```zig
 // shared.zig
 pub const Api = struct {
-    pub const top = web.endpoint.get("/scores/:game", .{
+    pub const top = http.endpoint.get("/scores/:game", .{
         .params = struct { game: []const u8 },
         .query = struct { limit: u8 = 10 },
         .result = []const Score,
@@ -90,11 +90,11 @@ pub const Api = struct {
 };
 
 // server.zig: checked against the contract at compile time.
-fn top(game: *Game, ctx: *web.ContextOf(Api.top)) !Api.top.result { ... }
+fn top(game: *Game, ctx: *http.ContextOf(Api.top)) !Api.top.result { ... }
 try router.bind(Api.top, &game, top);
 ```
 
-`web.endpoint.typescript.write(Api, writer, "game")` writes a client for
+`http.endpoint.typescript.write(Api, writer, "game")` writes a client for
 them: `gameApi(base)` with a typed method per endpoint, its types as
 `gameApi.Score`, and `HttpError` for an answer other than 2xx. netcode's
 bindings write it beside a module's glue when its bindings file has
@@ -112,17 +112,17 @@ request's head, ahead of its body (an answer there stops it), and `after`
 on every answer they send.
 
 ```zig
-const auth: web.Bearer = .{ .token = opts.token };
-const cors: web.Cors = .{ .origins = &.{"https://game.example"} };
-const admin = try router.scope("/admin").with(&.{ auth.middleware(), cors.middleware(), web.access_log });
+const auth: http.Bearer = .{ .token = opts.token };
+const cors: http.Cors = .{ .origins = &.{"https://game.example"} };
+const admin = try router.scope("/admin").with(&.{ auth.middleware(), cors.middleware(), http.access_log });
 try admin.get("/stats", app, stats);
 ```
 
-- `web.Bearer`: `Authorization: Bearer <token>`, or 401.
-- `web.Cors`: listed origins read the answers, others get 403, and
+- `http.Bearer`: `Authorization: Bearer <token>`, or 401.
+- `http.Cors`: listed origins read the answers, others get 403, and
   preflights are answered. A known path answers OPTIONS with `Allow`.
-- `web.RateLimit`: a token bucket per client address, or 429.
-- `web.access_log`: a line per answer.
+- `http.RateLimit`: a token bucket per client address, or 429.
+- `http.access_log`: a line per answer.
 
 A scope's `limit(n)` takes bodies up to `n` whatever its routes' `Spec`
 says, for a limit known at run time.
@@ -130,35 +130,35 @@ says, for a limit known at run time.
 ## Work that blocks
 
 A handler runs on its event loop's thread. Work that takes longer goes to
-a `web.Pool`, and its result answers the request back on the loop:
+a `http.Pool`, and its result answers the request back on the loop:
 
 ```zig
-fn upload(app: *App, ctx: *web.Context(.{ .body = []const u8, .max_body = 8 << 20 })) !void {
+fn upload(app: *App, ctx: *http.Context(.{ .body = []const u8, .max_body = 8 << 20 })) !void {
     try ctx.offload(app.compiler, compile, .{ app, ctx.body });
 }
 ```
 
-What `compile` returns answers it: a `web.Reply` as it is, anything else as
+What `compile` returns answers it: a `http.Reply` as it is, anything else as
 JSON, an error with its status. A full pool is 503. The answer comes back
 through the loop's `quic.Mailbox`, which a server stopping waits for.
 
 ## A listener of its own
 
-`web.Server` serves a router on an HTTP/1.1 listener of its own, with a
+`http.Server` serves a router on an HTTP/1.1 listener of its own, with a
 thread and loop of its own: a control or admin port beside a game's.
 
 ```zig
-const admin = try web.Server.create(gpa, &router, .{ .address = "127.0.0.1", .port = 4480 });
+const admin = try http.Server.create(gpa, &router, .{ .address = "127.0.0.1", .port = 4480 });
 defer admin.destroy();
 ```
 
 ## On quic-zig
 
 The handler of a quic-zig server passes its request callbacks on to a
-`web.quic.Host`, and the routes answer over HTTP/1.1 and HTTP/3 alike:
+`http.quic.Host`, and the routes answer over HTTP/1.1 and HTTP/3 alike:
 
 ```zig
-host: web.quic.Host, // .init(gpa, &router)
+host: http.quic.Host, // .init(gpa, &router)
 
 pub fn onHttpHead(self: *App, ex: *quic.event_loop.Exchange) void {
     self.host.onHttpHead(ex);
@@ -180,16 +180,16 @@ sized or chunked, is gathered before the handler runs, up to the route's
 
 ## Tests
 
-`web.testing.Client` calls a router's routes through the same `Host` a
+`http.testing.Client` calls a router's routes through the same `Host` a
 server runs, limits included, without a socket:
 
 ```zig
-var client: web.testing.Client = .init(std.testing.allocator, &router);
+var client: http.testing.Client = .init(std.testing.allocator, &router);
 defer client.deinit();
 try std.testing.expectEqual(404, (try client.get("/scores/7")).status);
 ```
 
-`web.testing.Http3` sends one request over HTTP/3 to a server in the
+`http.testing.Http3` sends one request over HTTP/3 to a server in the
 test. `zig build test` runs the package's own, real quic-zig servers'
 among them.
 

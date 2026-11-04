@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const quic = @import("quic");
-const web = @import("web.zig");
+const http = @import("http.zig");
 const sys = quic.sys;
 const event_loop = quic.event_loop;
 const expectEqual = std.testing.expectEqual;
@@ -14,8 +14,8 @@ const key_path = "../quic-zig/interop/browser/certs/server.key";
 const App = struct {
     pub const protocol: event_loop.Protocol = .webtransport;
 
-    router: web.Router,
-    host: web.quic.Host,
+    router: http.Router,
+    host: http.quic.Host,
     total: u64 = 0,
 
     pub fn onHttpHead(self: *App, ex: *event_loop.Exchange) void {
@@ -31,17 +31,17 @@ const App = struct {
         self.host.onHttpGone(ex);
     }
 
-    fn add(self: *App, ctx: *web.Context(.{ .body = struct { n: u64 } })) !struct { total: u64 } {
+    fn add(self: *App, ctx: *http.Context(.{ .body = struct { n: u64 } })) !struct { total: u64 } {
         self.total += ctx.body.n;
         return .{ .total = self.total };
     }
 
-    fn hello(_: *App, ctx: *web.Context(.{ .params = struct { name: []const u8 } })) !void {
+    fn hello(_: *App, ctx: *http.Context(.{ .params = struct { name: []const u8 } })) !void {
         try ctx.setHeader("Cache-Control", "no-store");
         try ctx.send(200, "text/plain", try std.fmt.allocPrint(ctx.arena, "hi {s}", .{ctx.params.name}));
     }
 
-    fn size(_: *App, ctx: *web.Context(.{ .body = []const u8, .max_body = 1 << 20 })) !usize {
+    fn size(_: *App, ctx: *http.Context(.{ .body = []const u8, .max_body = 1 << 20 })) !usize {
         return ctx.body.len;
     }
 };
@@ -140,7 +140,7 @@ test "HTTP/1.1: the router answers; what no route has goes on to the static file
     try std.testing.expect(std.mem.startsWith(u8, wrong, "HTTP/1.1 405 "));
     try std.testing.expect(has(wrong, "Allow: POST\r\n"));
 
-    const file = try h.fetch("GET /web.zig HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", &buf);
+    const file = try h.fetch("GET /http.zig HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", &buf);
     try std.testing.expect(std.mem.startsWith(u8, file, "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(has(bodyOf(file), "pub const Router"));
 }
@@ -184,16 +184,16 @@ test "HTTP/3: the same routes answer, a body comes in, and no route's path is 40
     try h.init(24914, null);
     defer h.deinit();
 
-    var a: web.testing.Http3 = .{ .path = "/hello/bob" };
+    var a: http.testing.Http3 = .{ .path = "/hello/bob" };
     try a.fetch(std.testing.allocator, &h.loop, h.port, &h);
     try expectEqualStrings("200", &a.status);
     try expectEqualStrings("hi bob", a.text());
 
-    var b: web.testing.Http3 = .{ .method = "POST", .path = "/add", .body = "{\"n\":5}" };
+    var b: http.testing.Http3 = .{ .method = "POST", .path = "/add", .body = "{\"n\":5}" };
     try b.fetch(std.testing.allocator, &h.loop, h.port, &h);
     try expectEqualStrings("{\"total\":5}", b.text());
 
-    var c: web.testing.Http3 = .{ .path = "/none" };
+    var c: http.testing.Http3 = .{ .path = "/none" };
     try c.fetch(std.testing.allocator, &h.loop, h.port, &h);
     try expectEqualStrings("404", &c.status);
 }
