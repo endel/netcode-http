@@ -4,6 +4,7 @@ const std = @import("std");
 const parser = @import("quic").http1.parser;
 const pool = @import("pool.zig");
 const Mailbox = @import("quic").Mailbox;
+const json_mod = @import("json.zig");
 
 const endpoint = @import("endpoint");
 pub const Method = endpoint.Method;
@@ -104,7 +105,9 @@ pub const Response = struct {
 
     pub fn json(self: *Response, status: u16, value: anytype) !void {
         if (self.answered) return;
-        self.answer(status, "application/json", try std.json.Stringify.valueAlloc(self.arena, value, .{}));
+        var out: std.Io.Writer.Allocating = try .initCapacity(self.arena, 256);
+        json_mod.write(&out.writer, value) catch return error.OutOfMemory;
+        self.answer(status, "application/json", out.written());
     }
 
     /// `status` with its reason phrase as the body.

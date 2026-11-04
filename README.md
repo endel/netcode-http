@@ -193,6 +193,17 @@ try std.testing.expectEqual(404, (try client.get("/scores/7")).status);
 test. `zig build test` runs the package's own, real quic-zig servers'
 among them.
 
+## Benchmarks
+
+`bench/run.ts` serves the same routes from http and from `Bun.serve` and
+loads both with [oha](https://github.com/hatoo/oha): HTTP/1.1, TLS, and
+HTTP/3 given an oha built with it (`OHA_H3`). It reports the server's CPU
+per request beside requests/s, which a busy machine skews.
+
+```sh
+zig build bench -Doptimize=ReleaseFast && bun bench/run.ts
+```
+
 ## License
 
 MIT

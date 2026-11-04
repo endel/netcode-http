@@ -36,6 +36,9 @@ pub const Method = context.Method;
 pub const Header = context.Header;
 
 pub const Reply = context.Reply;
+/// The JSON answers are written in, for a body built by hand (`Reply`).
+pub const json = @import("json.zig");
+
 
 pub const Middleware = middleware.Middleware;
 pub const Bearer = middleware.Bearer;
