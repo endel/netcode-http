@@ -3,7 +3,10 @@
     .version = "0.1.0",
     .fingerprint = 0x97780db217f6274d,
     .dependencies = .{
-        .quic = .{ .path = "../quic-zig" },
+        .quic = .{
+            .url = "git+https://github.com/endel/quic-zig#e7dc3eee3086fc460db37a01535f2c1a4c0f023f",
+            .hash = "quic-0.6.0-TPyrNHx9NgAM-bAqex5ofX5r4czA8uKl72316fgY693v",
+        },
     },
     .minimum_zig_version = "0.17.0",
     .paths = .{

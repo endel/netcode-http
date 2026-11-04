@@ -29,20 +29,24 @@ try router.post("/scores", &game, Game.submit);
 
 ## Using it
 
-Zig 0.17, and quic-zig checked out beside this one: `build.zig.zon` finds
-it at `../quic-zig`. The request API this builds on (`Exchange`,
-`Mailbox`) isn't on quic-zig's main yet.
+Zig 0.17:
+
+```sh
+zig fetch --save=http git+https://github.com/endel/netcode-http
+```
 
 ```zig
-// build.zig.zon
-.http = .{ .path = "../http" },
-
 // build.zig
 const http = b.dependency("http", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("http", http.module("http"));
 // Code shared with clients takes the contracts alone: std only.
 shared.addImport("endpoint", http.module("endpoint"));
 ```
+
+A project that also depends on quic-zig must pin the same commit this
+package does, or the build fails with "file exists in modules". To build
+against local checkouts instead of the pins:
+`zig build --fork=../quic-zig --fork=../http`.
 
 ## Handlers
 
