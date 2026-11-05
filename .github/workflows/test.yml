@@ -34,7 +34,9 @@ jobs:
       - name: Dev certificates
         run: quic-zig/interop/browser/generate-cert.sh
 
+      # A mirror that hangs instead of failing stalls this step; fail fast and rerun.
       - uses: mlugg/setup-zig@v2
+        timeout-minutes: 5
         with:
           version: 0.17.1
 
