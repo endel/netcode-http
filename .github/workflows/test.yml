@@ -1,0 +1,47 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: http
+
+      # The end-to-end test reads dev certificates from ../quic-zig, which its
+      # generate-cert.sh makes; check out the commit build.zig.zon pins.
+      - name: Find the pinned quic-zig
+        id: quic
+        run: echo "sha=$(sed -n 's/.*quic-zig#\([0-9a-f]*\)".*/\1/p' http/build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: endel/quic-zig
+          ref: ${{ steps.quic.outputs.sha }}
+          path: quic-zig
+
+      - name: Dev certificates
+        run: quic-zig/interop/browser/generate-cert.sh
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Build
+        working-directory: http
+        run: zig build && zig build bench
+
+      - name: Test
+        working-directory: http
+        run: zig build test --summary all
