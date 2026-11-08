@@ -44,7 +44,9 @@ Independent of 1.
 
 9. **In.** Streaming responses and SSE, sending from blocking handlers over 1's
    cancel handle.
-10. Streaming request bodies, then multipart on top.
+10. **In.** Streaming request bodies (bounded by `max_body` until quic-zig's
+    `Exchange` can pause one, `streaming.md`), then multipart on top, into
+    `.form` bodies with `File` fields.
 11. WebSocket and WebTransport routes, so 3's middleware runs on upgrades.
 
 ### 4. Standing alone (`server.md`, `packaging.md`)

@@ -204,6 +204,8 @@ pub const Call = struct {
     loop: ?*Mailbox = null,
     /// While a blocking handler runs: its answer as a stream (`Context.stream`).
     stream: ?*Stream = null,
+    /// A streamed body's (`endpoint.BodyStream`), read as it arrives.
+    body: ?*BodyReader = null,
     /// What middleware left for the handler, one per type, in the arena.
     locals: ?*Local = null,
 
@@ -312,6 +314,91 @@ pub const Stream = struct {
     };
 };
 
+/// A body as it arrives (`endpoint.BodyStream`): the loop queues its
+/// pieces, a blocking handler reads them. Each is its own allocation, freed
+/// once read, so a reader that keeps up holds little of a large upload.
+pub const BodyReader = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    head: ?*Piece = null,
+    tail: ?*Piece = null,
+    /// Into `head`, read so far.
+    at: usize = 0,
+    ended: bool = false,
+    failed: ?anyerror = null,
+
+    /// Its bytes follow it in the same allocation, from `smp_allocator`:
+    /// queued on the loop, freed on the reader's thread.
+    const Piece = struct {
+        next: ?*Piece = null,
+        len: usize,
+
+        fn bytes(p: *Piece) []u8 {
+            const base: [*]u8 = @ptrCast(p);
+            return (base + @sizeOf(Piece))[0..p.len];
+        }
+
+        fn free(p: *Piece) void {
+            const base: [*]align(@alignOf(Piece)) u8 = @ptrCast(p);
+            std.heap.smp_allocator.free(base[0 .. @sizeOf(Piece) + p.len]);
+        }
+    };
+
+    /// Up to `buf.len` bytes, waiting for some; 0 once the body has ended.
+    /// The client leaving or the deadline cancels the wait.
+    pub fn read(self: *BodyReader, buf: []u8) !usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.head == null) {
+            if (self.failed) |err| return err;
+            if (self.ended) return 0;
+            try self.cond.wait(self.io, &self.mutex);
+        }
+        const p = self.head.?;
+        const n = @min(buf.len, p.len - self.at);
+        @memcpy(buf[0..n], p.bytes()[self.at..][0..n]);
+        self.at += n;
+        if (self.at == p.len) {
+            self.head = p.next;
+            if (self.head == null) self.tail = null;
+            self.at = 0;
+            p.free();
+        }
+        return n;
+    }
+
+    /// On the loop: `data` queued for the reader.
+    pub fn push(self: *BodyReader, data: []const u8) !void {
+        const raw = try std.heap.smp_allocator.alignedAlloc(u8, .of(Piece), @sizeOf(Piece) + data.len);
+        const p: *Piece = @ptrCast(raw.ptr);
+        p.* = .{ .len = data.len };
+        @memcpy(p.bytes(), data);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.tail) |t| t.next = p else self.head = p;
+        self.tail = p;
+        self.cond.signal(self.io);
+    }
+
+    /// On the loop: the body ended, or failed with `err`.
+    pub fn end(self: *BodyReader, err: ?anyerror) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.ended = true;
+        if (self.failed == null) self.failed = err;
+        self.cond.signal(self.io);
+    }
+
+    /// Once nothing reads it: what's left freed.
+    pub fn deinit(self: *BodyReader) void {
+        while (self.head) |p| {
+            self.head = p.next;
+            p.free();
+        }
+    }
+};
+
 /// Server-sent events (`text/event-stream`), from a blocking handler (`Context.events`).
 pub const Events = struct {
     stream: *Stream,
@@ -364,7 +451,8 @@ pub fn Context(comptime spec: Spec) type {
 
         params: spec.params,
         query: spec.query,
-        body: spec.body,
+        /// A streamed one (`endpoint.BodyStream`) is read as it comes.
+        body: if (spec.body == endpoint.BodyStream) *BodyReader else spec.body,
         request: *const Request,
         response: *Response,
         /// Freed once the request is answered.

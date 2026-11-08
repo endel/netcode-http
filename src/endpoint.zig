@@ -37,9 +37,10 @@ pub const Spec = struct {
     /// Fields from the query string; one without a default, or optional,
     /// is required.
     query: type = struct {},
-    /// `void` for none, `[]const u8` for the bytes as they came, any other
-    /// type parsed from JSON. A JSON body sent as another `Content-Type` is
-    /// refused with 415: a cross-site form can't post one unasked.
+    /// `void` for none, `[]const u8` for the bytes as they came, `Multipart`
+    /// for a `multipart/form-data` one's parts, any other type parsed from
+    /// JSON. A body sent as another `Content-Type` than its kind is refused
+    /// with 415: a cross-site form can't post JSON unasked.
     body: type = void,
     /// The body may also come as an `application/x-www-form-urlencoded`
     /// form, read as a query is: its fields are a query's kind.
@@ -86,6 +87,95 @@ fn paramsMayFail(comptime P: type) bool {
     if (@hasDecl(P, "rules")) return true;
     for (@typeInfo(P).@"struct".field_types) |F| if (F != []const u8) return true;
     return false;
+}
+
+/// A form's file (`multipart/form-data`): a field of this type in a
+/// `.form` body takes the part named for it.
+pub const File = struct {
+    /// What it was called where it came from.
+    filename: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    data: []const u8,
+};
+
+/// The body as it arrives, a piece at a time (`http.BodyReader`): for a
+/// blocking handler, started at the request's head. Bounded by `max_body`.
+pub const BodyStream = struct {};
+
+/// A `multipart/form-data` body (RFC 7578), its parts slices of it: the
+/// raw form of what a `.form` body decodes, for names given more than once.
+pub const Multipart = struct {
+    parts: []const Part,
+
+    pub const Part = struct {
+        name: []const u8,
+        file: File,
+    };
+
+    /// The first part named `name`.
+    pub fn get(self: Multipart, name: []const u8) ?File {
+        for (self.parts) |p| if (std.mem.eql(u8, p.name, name)) return p.file;
+        return null;
+    }
+
+    /// `body`'s parts, `content_type` naming their boundary; `why`, if
+    /// given, says what's wrong with one it refuses.
+    pub fn parse(arena: std.mem.Allocator, content_type: []const u8, body: []const u8, why: ?*[]const u8) !Multipart {
+        const boundary = param(content_type, "boundary") orelse return fail(why, "body: multipart without a boundary");
+        // RFC 2046's limit, and what keeps a client's boundary from slowing the search down.
+        if (boundary.len == 0 or boundary.len > 70) return fail(why, "body: a multipart boundary of 1 to 70 characters");
+        var buf: [74]u8 = undefined;
+        const delimiter = std.fmt.bufPrint(&buf, "\r\n--{s}", .{boundary}) catch unreachable;
+        var parts: std.ArrayList(Part) = .empty;
+        var at = (std.mem.indexOf(u8, body, delimiter[2..]) orelse return fail(why, "body: no part")) + delimiter.len - 2;
+        while (!std.mem.startsWith(u8, body[at..], "--")) {
+            if (!std.mem.startsWith(u8, body[at..], "\r\n")) return fail(why, "body: a boundary not on its own line");
+            const head_end = std.mem.indexOfPos(u8, body, at + 2, "\r\n\r\n") orelse return fail(why, "body: a part's head doesn't end");
+            var disposition: ?[]const u8 = null;
+            var content_type_: ?[]const u8 = null;
+            var lines = std.mem.splitSequence(u8, body[at + 2 .. head_end], "\r\n");
+            while (lines.next()) |line| {
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                const key = line[0..colon];
+                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                if (std.ascii.eqlIgnoreCase(key, "content-disposition")) disposition = value;
+                if (std.ascii.eqlIgnoreCase(key, "content-type")) content_type_ = value;
+            }
+            const d = disposition orelse return fail(why, "body: a part without Content-Disposition");
+            const next = std.mem.indexOfPos(u8, body, head_end + 4, delimiter) orelse return fail(why, "body: a part doesn't end");
+            try parts.append(arena, .{
+                .name = param(d, "name") orelse return fail(why, "body: a part without a name"),
+                .file = .{ .filename = param(d, "filename"), .content_type = content_type_, .data = body[head_end + 4 .. next] },
+            });
+            at = next + delimiter.len;
+        }
+        return .{ .parts = parts.items };
+    }
+};
+
+/// The media type of `content_type`, its parameters aside.
+pub fn mediaType(content_type: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    return std.mem.trim(u8, content_type[0..end], " \t");
+}
+
+/// `name=value` or `name="value"` among a header's `;`-separated params.
+pub fn param(header: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, header, ';');
+    _ = it.next(); // the value itself
+    while (it.next()) |p| {
+        const kv = std.mem.trim(u8, p, " \t");
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, kv[0..eq], " \t"), name)) continue;
+        const v = std.mem.trim(u8, kv[eq + 1 ..], " \t");
+        return if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
+    }
+    return null;
+}
+
+fn fail(why: ?*[]const u8, text: []const u8) error{BadRequest} {
+    if (why) |w| w.* = text;
+    return error.BadRequest;
 }
 
 /// An error's answer (RFC 9457), as the server writes it and a client reads it.
@@ -217,11 +307,45 @@ pub fn decodeForm(comptime B: type, body: []const u8, arena: std.mem.Allocator, 
     return decodePairs(B, body, arena, why, "form");
 }
 
-/// Whether a `T` can come from a form: a struct of what a query's fields are.
+/// Whether a `T` can come from a form: a struct of what a query's fields
+/// are, and `File`s.
 pub fn formable(comptime T: type) bool {
     if (@typeInfo(T) != .@"struct") return false;
-    for (@typeInfo(T).@"struct".field_types) |F| if (!scalar(F)) return false;
+    for (@typeInfo(T).@"struct".field_types) |F| if (!scalar(F) and !isFile(F)) return false;
     return true;
+}
+
+pub fn isFile(comptime T: type) bool {
+    return T == File or T == ?File;
+}
+
+/// Whether a `T` has a `File` field: one sent only as a multipart form.
+pub fn hasFile(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    for (@typeInfo(T).@"struct".field_types) |F| if (isFile(F)) return true;
+    return false;
+}
+
+/// A multipart form (`multipart/form-data`) as `B`: a field takes the part
+/// named for it, a `File` the part whole.
+pub fn decodeMultipart(comptime B: type, content_type: []const u8, body: []const u8, arena: std.mem.Allocator, why: ?*[]const u8) !B {
+    const m = try Multipart.parse(arena, content_type, body, why);
+    const s = @typeInfo(B).@"struct";
+    var b: B = undefined;
+    inline for (s.field_names, s.field_types, s.field_attrs) |name, F, attrs| {
+        @field(b, name) = if (m.get(name)) |part|
+            if (comptime isFile(F)) part else parseScalar(F, part.data) catch return fail(why, "form." ++ name ++ ": not " ++ comptime kind(F))
+        else
+            try missing(F, attrs, name, "form", why);
+    }
+    return keepsRules(B, b, "form", arena, why);
+}
+
+/// A field no pair or part gave: its default, null, or refused.
+fn missing(comptime T: type, comptime attrs: std.lang.Type.Struct.FieldAttributes, comptime name: []const u8, comptime where: []const u8, why: ?*[]const u8) !T {
+    if (comptime attrs.defaultValue(T)) |d| return d;
+    if (@typeInfo(T) == .optional) return null;
+    return fail(why, where ++ "." ++ name ++ " is required");
 }
 
 /// What a param, a query's field or a form's is: the types `parseScalar` reads.
@@ -243,25 +367,17 @@ fn decodePairs(comptime Q: type, raw: []const u8, arena: std.mem.Allocator, why:
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
         const key = try percentDecode(arena, pair[0..eq], true);
         inline for (s.field_names, s.field_types, 0..) |name, T, i| {
+            // A file comes only in a multipart form.
+            if (comptime isFile(T)) continue;
             if (!seen[i] and std.mem.eql(u8, key, name)) {
                 const value = try percentDecode(arena, if (eq < pair.len) pair[eq + 1 ..] else "", true);
-                @field(q, name) = parseScalar(T, value) catch {
-                    if (why) |w| w.* = where ++ "." ++ name ++ ": not " ++ comptime kind(T);
-                    return error.BadRequest;
-                };
+                @field(q, name) = parseScalar(T, value) catch return fail(why, where ++ "." ++ name ++ ": not " ++ comptime kind(T));
                 seen[i] = true;
             }
         }
     }
     inline for (s.field_names, s.field_types, s.field_attrs, 0..) |name, T, attrs, i| {
-        if (!seen[i]) @field(q, name) = if (comptime attrs.defaultValue(T)) |d|
-            d
-        else if (@typeInfo(T) == .optional)
-            null
-        else {
-            if (why) |w| w.* = where ++ "." ++ name ++ " is required";
-            return error.BadRequest;
-        };
+        if (!seen[i]) @field(q, name) = try missing(T, attrs, name, where, why);
     }
     return keepsRules(Q, q, where, arena, why);
 }
@@ -270,6 +386,8 @@ fn decodePairs(comptime Q: type, raw: []const u8, arena: std.mem.Allocator, why:
 /// type from JSON, unknown fields skipped. A body it refuses, `why` (if
 /// given) says what's wrong with.
 pub fn decodeBody(comptime B: type, body: []const u8, arena: std.mem.Allocator, why: ?*[]const u8) !B {
+    if (B == Multipart) @compileError("a multipart body is read with its Content-Type: Multipart.parse");
+    if (B == BodyStream) @compileError("a streamed body is read as it comes: http.BodyReader");
     if (B == void) return {};
     if (B == []const u8) return body;
     var scanner: std.json.Scanner = .initCompleteInput(arena, body);
@@ -443,6 +561,8 @@ pub fn writeTarget(comptime e: Endpoint, args: Args(e), w: *Writer) Writer.Error
 /// `[]const u8` body; nothing for `void`.
 pub fn writeBody(comptime e: Endpoint, args: Args(e), w: *Writer) Writer.Error!void {
     const B = e.spec.body;
+    if (B == Multipart) @compileError(e.path ++ ": a Zig client doesn't write multipart bodies yet");
+    if (B == BodyStream) @compileError(e.path ++ ": a Zig client doesn't stream a body yet");
     if (B == void) return;
     if (B == []const u8) return w.writeAll(args.body);
     try std.json.Stringify.value(args.body, .{}, w);
@@ -450,7 +570,12 @@ pub fn writeBody(comptime e: Endpoint, args: Args(e), w: *Writer) Writer.Error!v
 
 /// The Content-Type of a call's body, none without one.
 pub fn contentType(comptime e: Endpoint) ?[]const u8 {
-    return if (e.spec.body == void) null else if (e.spec.body == []const u8) "application/octet-stream" else "application/json";
+    return switch (e.spec.body) {
+        void => null,
+        []const u8, BodyStream => "application/octet-stream",
+        Multipart => "multipart/form-data",
+        else => "application/json",
+    };
 }
 
 /// The answer to a call of `e`: `status` and `body` as they came, the
@@ -529,9 +654,9 @@ test "an answer: the result from a 2xx, the status and its body otherwise" {
     const e = get("/top", .{ .result = []const struct { player: []const u8, points: u32 } });
     const ok = decodeAnswer(e, 200, "[{\"player\":\"ann\",\"points\":3,\"extra\":1}]", arena.allocator());
     try std.testing.expectEqualStrings("ann", ok.ok[0].player);
-    const missing = decodeAnswer(e, 404, "no", arena.allocator()).status;
-    try std.testing.expectEqual(404, missing.code);
-    try std.testing.expectEqual(null, missing.problem(arena.allocator()));
+    const not_found = decodeAnswer(e, 404, "no", arena.allocator()).status;
+    try std.testing.expectEqual(404, not_found.code);
+    try std.testing.expectEqual(null, not_found.problem(arena.allocator()));
     const taken = decodeAnswer(e, 409, "{\"title\":\"Conflict\",\"status\":409,\"detail\":\"seat taken\"}", arena.allocator()).status;
     try std.testing.expectEqualStrings("seat taken", taken.problem(arena.allocator()).?.detail.?);
     try std.testing.expect(decodeAnswer(e, 200, "{", arena.allocator()) == .failed);
@@ -559,4 +684,34 @@ test {
     _ = typescript;
     _ = openapi;
     _ = rules;
+}
+
+test "a multipart body's parts: fields and files, a quoted boundary, refusals that say why" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "preamble\r\n--xyz\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nmy map\r\n" ++
+        "--xyz\r\nContent-Disposition: form-data; name=\"map\"; filename=\"de_dust.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n\x00\r\n\x01\r\n" ++
+        "--xyz--\r\n";
+    const m = try Multipart.parse(a, "multipart/form-data; boundary=\"xyz\"", body, null);
+    try std.testing.expectEqual(2, m.parts.len);
+    try std.testing.expectEqualStrings("my map", m.get("title").?.data);
+    const map = m.get("map").?;
+    try std.testing.expectEqualStrings("de_dust.bin", map.filename.?);
+    try std.testing.expectEqualStrings("application/octet-stream", map.content_type.?);
+    try std.testing.expectEqualStrings("\x00\r\n\x01", map.data);
+    try std.testing.expectEqual(null, m.get("none"));
+
+    var why: []const u8 = "";
+    try std.testing.expectError(error.BadRequest, Multipart.parse(a, "multipart/form-data", body, &why));
+    try std.testing.expectEqualStrings("body: multipart without a boundary", why);
+    try std.testing.expectError(error.BadRequest, Multipart.parse(a, "multipart/form-data; boundary=xyz", "--xyz\r\nContent-Disposition: form-data; name=a\r\n\r\nno end", &why));
+    try std.testing.expectEqualStrings("body: a part doesn't end", why);
+    const long = comptime blk: {
+        var t: []const u8 = "multipart/form-data; boundary=";
+        for (0..71) |_| t = t ++ "b";
+        break :blk t;
+    };
+    try std.testing.expectError(error.BadRequest, Multipart.parse(a, long, body, &why));
+    try std.testing.expectEqualStrings("body: a multipart boundary of 1 to 70 characters", why);
 }

@@ -25,11 +25,17 @@ it off with a reset. Left over:
 
 ## Request bodies
 
-`Host` gathers the body up to the route's `max_body` before the handler
-runs (`src/quic.zig`), and reserves up to 1 MiB of a known length at the
-head. Uploads past memory need the body handed over as it arrives: quic-zig
-already delivers it in pieces (`onHttpBody`). A body could be a reader in
-the `Spec`, `.body = http.BodyStream`, say.
+**In:** `.body = endpoint.BodyStream`: a blocking handler, started at the
+head, reads pieces as the loop queues them (`BodyReader`), each its own
+`smp_allocator` allocation freed once read. Left over:
+
+- Bounded by `max_body`: quic-zig's `Exchange` can't pause a body, so a
+  reader slower than the upload lets its pieces pile up to that. With
+  `pauseBody`/`resumeBody` on `Exchange` (HTTP/1.1's `RawConn.pauseReading`
+  and HTTP/3's `Session.pauseRequestBody` exist), the cap could become
+  only the unread backlog's.
+- Multipart parts streamed to disk instead of gathered.
+- A Zig client that streams a body.
 
 ## SSE
 

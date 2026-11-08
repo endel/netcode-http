@@ -34,28 +34,28 @@ const Route = struct {
     max_body: usize,
 };
 
-/// The body by its `Content-Type`: JSON, the spec's `form` if it takes one,
-/// 415 for anything else. None at all is read as JSON.
+/// The body by its `Content-Type`: JSON, the spec's `form` if it takes one
+/// (urlencoded or multipart), 415 for anything else. None is read as JSON.
 fn decodeBody(comptime spec: endpoint.Spec, req: *const Request, arena: std.mem.Allocator, why: *[]const u8) !spec.body {
     const B = spec.body;
+    if (comptime spec.form and !endpoint.formable(B)) @compileError("a .form body is a struct of a query's kind of fields and Files");
     if (comptime B == void or B == []const u8) return endpoint.decodeBody(B, req.body, arena, why);
-    const t = req.header("content-type") orelse return endpoint.decodeBody(B, req.body, arena, why);
-    if (isMedia(t, "application/json") or jsonSuffix(t)) return endpoint.decodeBody(B, req.body, arena, why);
-    if (spec.form and isMedia(t, "application/x-www-form-urlencoded")) return endpoint.decodeForm(B, req.body, arena, why);
+    const t = req.header("content-type") orelse "";
+    const media = endpoint.mediaType(t);
+    if (comptime B == endpoint.Multipart) {
+        if (std.ascii.eqlIgnoreCase(media, "multipart/form-data")) return endpoint.Multipart.parse(arena, t, req.body, why);
+        why.* = "body: multipart/form-data, by its Content-Type";
+        return error.UnsupportedMediaType;
+    }
+    if (t.len == 0 or std.ascii.eqlIgnoreCase(media, "application/json") or std.ascii.endsWithIgnoreCase(media, "+json")) {
+        return endpoint.decodeBody(B, req.body, arena, why);
+    }
+    if (spec.form) {
+        if (std.ascii.eqlIgnoreCase(media, "application/x-www-form-urlencoded")) return endpoint.decodeForm(B, req.body, arena, why);
+        if (std.ascii.eqlIgnoreCase(media, "multipart/form-data")) return endpoint.decodeMultipart(B, t, req.body, arena, why);
+    }
     why.* = if (spec.form) "body: JSON or a form, by its Content-Type" else "body: JSON, by its Content-Type";
     return error.UnsupportedMediaType;
-}
-
-/// Whether `content_type`, its parameters aside, is `media`.
-fn isMedia(content_type: []const u8, media: []const u8) bool {
-    const end = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, content_type[0..end], " \t"), media);
-}
-
-/// `application/problem+json` and the like.
-fn jsonSuffix(content_type: []const u8) bool {
-    const end = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
-    return std.ascii.endsWithIgnoreCase(std.mem.trim(u8, content_type[0..end], " \t"), "+json");
 }
 
 /// A request its spec refuses: `why` as the problem's detail.
@@ -93,7 +93,7 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
             var ctx: Ctx = .{
                 .params = try endpoint.decodeParams(Ctx.web_spec.params, names, rest, captures, arena),
                 .query = endpoint.decodeQuery(Ctx.web_spec.query, c.request.rawQuery(), arena, &why) catch |err| return refuse(c, err, why),
-                .body = decodeBody(Ctx.web_spec, &c.request, arena, &why) catch |err| return refuse(c, err, why),
+                .body = if (comptime Ctx.web_spec.body == endpoint.BodyStream) c.body.? else decodeBody(Ctx.web_spec, &c.request, arena, &why) catch |err| return refuse(c, err, why),
                 .request = &c.request,
                 .response = &c.response,
                 .arena = arena,
@@ -229,6 +229,8 @@ pub const Router = struct {
         gate: ?*Gate = null,
         /// Its scope's own errors' answers, the innermost scope's first.
         errors: []const ErrorAnswer = &.{},
+        /// Its body is read as it arrives (`endpoint.BodyStream`): the handler starts at the head.
+        streams_body: bool = false,
     };
     const Entry = struct { method: Method, path: []const u8, target: Target };
 
@@ -497,6 +499,9 @@ pub const Scope = struct {
     }
 
     pub fn on(self: Scope, comptime method: Method, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        // A streamed body is read while it arrives: by a handler off the loop.
+        const streams = comptime route(pattern, handler).Ctx.web_spec.body == endpoint.BodyStream;
+        if (streams and self.runs_on == null) return error.BodyStreamNotBlocking;
         const path = try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, pattern });
         return self.router.insert(method, path, self.targetFor(pattern, app, handler));
     }
@@ -538,6 +543,7 @@ pub const Scope = struct {
             .deadline_ns = self.deadline_ns,
             .gate = self.gate,
             .errors = self.answers,
+            .streams_body = r.Ctx.web_spec.body == endpoint.BodyStream,
         };
     }
     pub fn get(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {

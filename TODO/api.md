@@ -55,8 +55,10 @@ body too, read as a query is, rules and details alike (`form.age: at least
 13`). A JSON body sent as another `Content-Type` is 415, so a cross-site
 form can't post one without a preflight. Left over:
 
-- `multipart/form-data` with file parts, streamed to disk rather than
-  gathered (`streaming.md`).
+- **In:** `multipart/form-data` into a `.form` body, `endpoint.File`
+  fields taking file parts, or its raw parts (`endpoint.Multipart`), from
+  the gathered body. Streamed to disk instead waits on quic-zig pausing a
+  body (`streaming.md`).
 
 ## Content negotiation
 

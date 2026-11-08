@@ -544,3 +544,55 @@ test "on a server: a stream past what the socket takes waits for the client, and
     try std.testing.expect(std.mem.endsWith(u8, got, "\r\n0\r\n\r\n"));
     try expectEqual(64 * 1024 * 64, std.mem.count(u8, bodyOf(got), "x"));
 }
+
+/// Reads its body three bytes at a time, as it comes.
+fn sumStreamed(ctx: *http.Context(.{ .body = http.endpoint.BodyStream, .max_body = 1 << 20 })) !struct { bytes: usize, sum: u64 } {
+    var buf: [3]u8 = undefined;
+    var bytes: usize = 0;
+    var sum: u64 = 0;
+    while (true) {
+        const n = try ctx.body.read(&buf);
+        if (n == 0) break;
+        bytes += n;
+        for (buf[0..n]) |b| sum += b;
+    }
+    return .{ .bytes = bytes, .sum = sum };
+}
+
+test "a streamed body is read as it arrives, by a blocking handler; past max_body it's 413" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    const blocking = try router.scope("").blocking(threaded.io(), .{});
+    try blocking.post("/sum", {}, sumStreamed);
+    try blocking.post("/small", {}, sumSmall);
+    try std.testing.expectError(error.BodyStreamNotBlocking, router.post("/loop", {}, sumStreamed));
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    try expectEqualStrings("{\"bytes\":10,\"sum\":525}", (try c.post("/sum", "0123456789")).body);
+    try expectEqualStrings("{\"bytes\":0,\"sum\":0}", (try c.post("/sum", "")).body);
+
+    const server = try http.Server.create(gpa, &router, .{});
+    defer server.destroy();
+    var buf: [4096]u8 = undefined;
+    const body: [300 * 1024]u8 = @splat(1);
+    const request = try std.fmt.allocPrint(gpa, "POST /sum HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, &body });
+    defer gpa.free(request);
+    try expectEqualStrings("{\"bytes\":307200,\"sum\":307200}", bodyOf(try fetch(server.port(), request, &buf)));
+    // Chunked, no length to refuse at the head: refused once past it.
+    const chunked = "POST /small HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n";
+    try std.testing.expect(std.mem.startsWith(u8, try fetch(server.port(), chunked, &buf), "HTTP/1.1 413 "));
+}
+
+fn sumSmall(ctx: *http.Context(.{ .body = http.endpoint.BodyStream, .max_body = 8 })) !usize {
+    var buf: [16]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try ctx.body.read(&buf);
+        if (n == 0) return total;
+        total += n;
+    }
+}

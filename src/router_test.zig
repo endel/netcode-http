@@ -383,3 +383,58 @@ test "a body by its Content-Type: JSON, a form where the spec takes one, 415 oth
     // A cross-site form posts text/plain without asking first: refused, though it parses.
     try expectEqualStrings("body: JSON, by its Content-Type", try refusalAs(&c, 415, "/signup", text, ann));
 }
+
+fn upload(ctx: *http.Context(.{ .body = http.endpoint.Multipart })) !struct { title: []const u8, file: []const u8, size: usize } {
+    const map = ctx.body.get("map") orelse return error.BadRequest;
+    return .{ .title = (ctx.body.get("title") orelse return error.BadRequest).data, .file = map.filename orelse "", .size = map.data.len };
+}
+
+test "a multipart body's parts, by its Content-Type; another is 415, a broken one 400 with why" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.post("/maps", {}, upload);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+    const multipart: []const http.Header = &.{.{ .name = "Content-Type", .value = "multipart/form-data; boundary=b0und" }};
+    const body = "--b0und\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nde_dust\r\n" ++
+        "--b0und\r\nContent-Disposition: form-data; name=\"map\"; filename=\"dust.bin\"\r\n\r\n1234\r\n--b0und--\r\n";
+
+    try expectEqualStrings("{\"title\":\"de_dust\",\"file\":\"dust.bin\",\"size\":4}", (try c.request(.POST, "/maps", .{ .headers = multipart, .body = body })).body);
+    try expectEqualStrings("body: multipart/form-data, by its Content-Type", try refusalAs(&c, 415, "/maps", &.{}, body));
+    try expectEqualStrings("body: a part doesn't end", try refusalAs(&c, 400, "/maps", multipart, "--b0und\r\nContent-Disposition: form-data; name=a\r\n\r\nx"));
+}
+
+const Avatar = struct {
+    name: []const u8,
+    picture: http.endpoint.File,
+    pub const rules = .{ .name = .{ .min_len = 1 } };
+};
+
+fn avatar(ctx: *http.Context(.{ .body = Avatar, .form = true })) !struct { name: []const u8, file: []const u8, bytes: usize } {
+    return .{ .name = ctx.body.name, .file = ctx.body.picture.filename orelse "", .bytes = ctx.body.picture.data.len };
+}
+
+test "a .form body from a multipart form: its fields, a File whole, rules and all; urlencoded can't carry the file" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.put("/avatar", {}, avatar);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+    const multipart: []const http.Header = &.{.{ .name = "Content-Type", .value = "multipart/form-data; boundary=x" }};
+    const form: []const http.Header = &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" }};
+    const body = "--x\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nann\r\n" ++
+        "--x\r\nContent-Disposition: form-data; name=\"picture\"; filename=\"ann.png\"\r\nContent-Type: image/png\r\n\r\nPNG!\r\n--x--\r\n";
+
+    const ok = try c.request(.PUT, "/avatar", .{ .headers = multipart, .body = body });
+    try expectEqualStrings("{\"name\":\"ann\",\"file\":\"ann.png\",\"bytes\":4}", ok.body);
+    try expectEqualStrings("form.name: at least 1 byte long", try refusalAsPut(&c, "/avatar", multipart, "--x\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n\r\n" ++
+        "--x\r\nContent-Disposition: form-data; name=\"picture\"\r\n\r\nPNG!\r\n--x--\r\n"));
+    try expectEqualStrings("form.picture is required", try refusalAsPut(&c, "/avatar", form, "name=ann&picture=x"));
+}
+
+fn refusalAsPut(c: *http.testing.Client, target: []const u8, headers: []const http.Header, body: []const u8) ![]const u8 {
+    const answer = try c.request(.PUT, target, .{ .headers = headers, .body = body });
+    try expectEqual(400, answer.status.?);
+    const Problem = struct { detail: []const u8 };
+    return (try std.json.parseFromSliceLeaky(Problem, c.arena.allocator(), answer.body, .{ .ignore_unknown_fields = true })).detail;
+}

@@ -78,11 +78,14 @@ fn operation(comptime n: api.Named) []const u8 {
         params = params ++ comma(params.len) ++ "{\"name\":" ++ str(f) ++ ",\"in\":\"query\",\"required\":" ++ required ++ ",\"schema\":" ++ field(s.query, f, F, a) ++ "}";
     }
     if (params.len > 0) out = out ++ ",\"parameters\":[" ++ params ++ "]";
-    if (s.body != void) out = out ++ ",\"requestBody\":{\"required\":true,\"content\":{" ++ if (s.body == []const u8)
+    if (s.body != void) out = out ++ ",\"requestBody\":{\"required\":true,\"content\":{" ++ if (s.body == []const u8 or s.body == endpoint.BodyStream)
         "\"application/octet-stream\":{\"schema\":{\"type\":\"string\",\"format\":\"binary\"}}}}"
+    else if (s.body == endpoint.Multipart)
+        "\"multipart/form-data\":{\"schema\":{\"type\":\"object\"}}}}"
     else
         "\"application/json\":{\"schema\":" ++ schema(s.body, .{}) ++ "}" ++
-            (if (s.form) ",\"application/x-www-form-urlencoded\":{\"schema\":" ++ schema(s.body, .{}) ++ "}" else "") ++ "}}";
+            (if (s.form and !endpoint.hasFile(s.body)) ",\"application/x-www-form-urlencoded\":{\"schema\":" ++ schema(s.body, .{}) ++ "}" else "") ++
+            (if (s.form) ",\"multipart/form-data\":{\"schema\":" ++ schema(s.body, .{}) ++ "}" else "") ++ "}}";
     out = out ++ ",\"responses\":{" ++ if (e.result == void)
         "\"204\":{\"description\":\"No Content\"}"
     else
@@ -119,6 +122,7 @@ fn schema(comptime T: type, comptime rule: anytype) []const u8 {
         ",\"maximum\":" ++ (hi orelse std.fmt.comptimePrint("{d}", .{std.math.maxInt(T)})) ++ "}";
     const limits = (if (lo) |v| ",\"minimum\":" ++ v else "") ++ (if (hi) |v| ",\"maximum\":" ++ v else "") ++ len;
     if (T == []const u8 or T == []u8) return extend("{\"type\":\"string\"}", limits);
+    if (T == endpoint.File) return "{\"type\":\"string\",\"format\":\"binary\"}";
     switch (@typeInfo(T)) {
         .@"struct", .@"enum", .@"union" => if (@hasDecl(T, "jsonStringify")) {
             if (!@hasDecl(T, "json_schema")) @compileError(@typeName(T) ++ " writes its own JSON: say what it looks like, with `pub const json_schema`");

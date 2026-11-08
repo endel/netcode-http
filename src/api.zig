@@ -2,7 +2,8 @@
 //! generators (`typescript`, `openapi`) walk.
 
 const std = @import("std");
-const Endpoint = @import("endpoint.zig").Endpoint;
+const endpoint = @import("endpoint.zig");
+const Endpoint = endpoint.Endpoint;
 
 pub const Named = struct { name: []const u8, ep: Endpoint };
 /// A named struct, and its name worked out once.
@@ -23,7 +24,7 @@ pub fn endpointsOf(comptime Api: type) []const Named {
 pub fn recordsOf(comptime eps: []const Named) []const Record {
     var list: []const Record = &.{};
     for (eps) |e| for (.{ e.ep.spec.params, e.ep.spec.query, e.ep.spec.body, e.ep.result }) |T| {
-        list = recordsIn(list, T);
+        if (T != endpoint.Multipart and T != endpoint.BodyStream) list = recordsIn(list, T);
     };
     for (list, 0..) |a, i| for (list[i + 1 ..]) |b| if (std.mem.eql(u8, a.name, b.name)) {
         @compileError("two types cross as " ++ a.name ++ ": " ++ @typeName(a.T) ++ " and " ++ @typeName(b.T));
@@ -55,7 +56,7 @@ pub fn recordsIn(comptime list: []const Record, comptime T: type) []const Record
         .pointer => |p| return recordsIn(list, p.child),
         .array => |a| return recordsIn(list, a.child),
         .@"struct" => |s| {
-            if (@hasDecl(T, "jsonStringify")) return list;
+            if (@hasDecl(T, "jsonStringify") or T == endpoint.File) return list;
             for (list) |seen| if (seen.T == T) return list;
             var out: []const Record = if (ownName(T)) |n| list ++ .{Record{ .T = T, .name = n }} else list;
             for (s.field_types) |F| out = recordsIn(out, F);

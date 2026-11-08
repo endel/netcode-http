@@ -111,8 +111,14 @@ const Signup = struct {
   its own 404 (`return error.NotFound`) and leaves `/` to static files.
 - A JSON body comes as `application/json` (or none): a cross-site form
   can't post one unasked. Another `Content-Type` is 415, unless the spec
-  takes `.form = true` and it's `application/x-www-form-urlencoded`, read
-  as a query is.
+  takes `.form = true` and it's a form: `application/x-www-form-urlencoded`
+  read as a query is, or `multipart/form-data`, whose `http.endpoint.File`
+  fields take a file part whole (`filename`, `content_type`, `data`).
+  `.body = http.endpoint.Multipart` gives the raw parts instead.
+- `.body = http.endpoint.BodyStream` reads the body as it arrives:
+  `ctx.body.read(&buf)` in a blocking handler, started at the request's
+  head, each piece freed once read. It's bounded by `max_body`, and the
+  upload counts against the scope's deadline and `max_running`.
 - `ctx.request.cookie(name)` reads a cookie; `ctx.setCookie(name, value,
   .{ .max_age = 3600 })` sets one, `Secure`, `HttpOnly` and `SameSite=Lax`
   unless it says otherwise, and `ctx.response.clearCookie` drops it.

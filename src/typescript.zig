@@ -53,12 +53,24 @@ pub fn write(comptime Api: type, w: *std.Io.Writer, comptime name: []const u8) !
         \\/** The endpoints, under `base`: `https://game.example`, or a prefix they're mounted at. */
         \\export function {s}(base: string | URL, init: RequestInit = {{}}) {{
         \\  const root = String(base).replace(/\/$/, "");
-        \\  async function call(method: string, path: string, query: object | undefined, body: unknown, answers = true, raw = false): Promise<any> {{
+        \\  async function call(method: string, path: string, query: object | undefined, body: unknown, answers = true, as: "json" | "bytes" | "form" = "json"): Promise<any> {{
         \\    const url = new URL(root + path);
         \\    for (const [k, v] of Object.entries(query ?? {{}})) if (v != null) url.searchParams.set(k, String(v));
         \\    const headers = new Headers(init.headers);
-        \\    if (body !== undefined) headers.set("content-type", raw ? "application/octet-stream" : "application/json");
-        \\    const res = await fetch(url, {{ ...init, method, headers, body: raw ? (body as BodyInit) : JSON.stringify(body) }});
+        \\    let payload: BodyInit | undefined = undefined;
+        \\    if (body === undefined) {{}}
+        \\    else if (as === "json") {{
+        \\      headers.set("content-type", "application/json");
+        \\      payload = JSON.stringify(body);
+        \\    }} else if (as === "form" && !(body instanceof FormData)) {{
+        \\      const form = new FormData();
+        \\      for (const [k, v] of Object.entries(body as object)) if (v != null) form.append(k, v instanceof Blob ? v : String(v));
+        \\      payload = form; // its own Content-Type, boundary and all
+        \\    }} else {{
+        \\      if (!(body instanceof FormData)) headers.set("content-type", "application/octet-stream");
+        \\      payload = body as BodyInit;
+        \\    }}
+        \\    const res = await fetch(url, {{ ...init, method, headers, body: payload }});
         \\    if (!res.ok) throw new HttpError(res.status, await res.text(), res.headers.get("content-type"));
         \\    return answers ? res.json() : undefined;
         \\  }}
@@ -97,14 +109,15 @@ fn commentSafe(comptime text: []const u8) []const u8 {
 fn method(comptime name: []const u8, comptime e: Endpoint, comptime ns: []const u8) []const u8 {
     const s = e.spec;
     const has_query = @typeInfo(s.query).@"struct".field_names.len > 0;
-    const raw = s.body == []const u8;
+    const raw = s.body == []const u8 or s.body == endpoint.Multipart or s.body == endpoint.BodyStream;
     var args: []const u8 = "";
     if (@typeInfo(s.params).@"struct".field_names.len > 0) args = args ++ ", params: " ++ object(s.params, false, ns);
-    if (s.body != void) args = args ++ ", body: " ++ (if (raw) "string | Uint8Array" else tsType(s.body, ns));
+    if (s.body != void) args = args ++ ", body: " ++ (if (s.body == endpoint.Multipart) "FormData" else if (raw) "string | Uint8Array" else tsType(s.body, ns));
     if (has_query) args = args ++ ", query" ++ (if (allOptional(s.query)) "?" else "") ++ ": " ++ object(s.query, true, ns);
     const result = if (e.result == void) "void" else tsType(e.result, ns);
     // `call`'s defaults: an answer to parse, a JSON body.
-    const rest = if (raw) (if (e.result == void) ", false, true" else ", true, true") else if (e.result == void) ", false" else "";
+    const as = if (raw) "\"bytes\"" else if (s.form and endpoint.hasFile(s.body)) "\"form\"" else "";
+    const rest = if (as.len > 0) (if (e.result == void) ", false, " else ", true, ") ++ as else if (e.result == void) ", false" else "";
     return name ++ ": (" ++ (if (args.len > 0) args[2..] else "") ++ "): Promise<" ++ result ++ "> => call(\"" ++ @tagName(e.method) ++
         "\", `" ++ pathTemplate(e.path) ++ "`, " ++ (if (has_query) "query" else "undefined") ++ ", " ++ (if (s.body != void) "body" else "undefined") ++ rest ++ ")";
 }
@@ -137,6 +150,7 @@ fn object(comptime T: type, comptime query: bool, comptime ns: []const u8) []con
 /// `T` as std.json writes it.
 fn tsType(comptime T: type, comptime ns: []const u8) []const u8 {
     if (T == []const u8 or T == []u8) return "string";
+    if (T == endpoint.File) return "Blob";
     switch (@typeInfo(T)) {
         .@"struct", .@"enum", .@"union" => if (@hasDecl(T, "jsonStringify")) {
             if (!@hasDecl(T, "ts_type")) @compileError(@typeName(T) ++ " writes its own JSON: say how TypeScript reads it, with `pub const ts_type`");
@@ -172,6 +186,8 @@ const TestApi = struct {
     pub const submit = endpoint.post("/scores", .{ .body = Score, .result = struct { rank: ?u32 } });
     pub const upload = endpoint.put("/maps/:name", .{ .params = struct { name: []const u8 }, .body = []const u8 });
     pub const thread = endpoint.get("/thread", .{ .result = Thread });
+    pub const map = endpoint.post("/maps", .{ .body = endpoint.Multipart });
+    pub const avatar = endpoint.put("/avatar", .{ .body = struct { name: []const u8, picture: endpoint.File }, .form = true });
     pub const claim = endpoint.post("/claim", .{ .errors = &.{ .{ .status = 409, .why = "taken */ already" }, .{ .status = 404 } } });
     pub const not_one = 3;
 };
@@ -185,9 +201,11 @@ test "an API's client: an interface per named struct, a method per endpoint" {
         "export namespace gameApi {\n  export interface Score {\n    player: string;\n    points: number;\n    mode?: \"solo\" | \"team\";\n    tag?: string;\n  }\n",
         "    score: (params: { game: string; }, query?: { top?: number; since?: number | null; }): Promise<gameApi.Score[]> => call(\"GET\", `/scores/${encodeURIComponent(params.game)}`, query, undefined),",
         "    submit: (body: gameApi.Score): Promise<{ rank: number | null; }> => call(\"POST\", `/scores`, undefined, body),",
-        "    upload: (params: { name: string; }, body: string | Uint8Array): Promise<void> => call(\"PUT\", `/maps/${encodeURIComponent(params.name)}`, undefined, body, false, true),",
+        "    upload: (params: { name: string; }, body: string | Uint8Array): Promise<void> => call(\"PUT\", `/maps/${encodeURIComponent(params.name)}`, undefined, body, false, \"bytes\"),",
         "export function gameApi(base: string | URL, init: RequestInit = {}) {",
         "  export interface Thread {\n    text: string;\n    replies: gameApi.Thread[];\n  }\n",
+        "    map: (body: FormData): Promise<void> => call(\"POST\", `/maps`, undefined, body, false, \"bytes\"),",
+        "    avatar: (body: { name: string; picture: Blob; }): Promise<void> => call(\"PUT\", `/avatar`, undefined, body, false, \"form\"),",
         "    /**\n     * POST /claim\n     * @throws {HttpError} 409 taken *\\/ already\n     * @throws {HttpError} 404\n     */\n    claim: (): Promise<void>",
     }) |line| {
         if (std.mem.indexOf(u8, ts, line) == null) {

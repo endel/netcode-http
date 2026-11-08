@@ -38,6 +38,8 @@ pub const Host = struct {
         content_length: ?u64,
         /// A blocking handler's, once it's started.
         off: ?*OffLoop = null,
+        /// A streamed body's bytes so far, against `max_body`.
+        streamed_len: usize = 0,
     };
 
     /// From here quic-zig's HTTP/1.1 and HTTP/3 alike owe `onHttpWritable`:
@@ -83,11 +85,24 @@ pub const Host = struct {
             return answer(p);
         };
         if ((ex.content_length orelse 0) > target.max_body) return fail(p, 413);
+        if (target.streams_body) {
+            const reader = a.create(context.BodyReader) catch return fail(p, 500);
+            reader.* = .{ .io = target.runs_on.?.io };
+            p.call.body = reader;
+            return spawn(p, target.runs_on.?);
+        }
         if (ex.content_length) |n| p.body.ensureTotalCapacityPrecise(a, @min(n, eager_body)) catch return fail(p, 500);
     }
 
     pub fn onHttpBody(_: *Host, ex: *Exchange, data: []const u8) void {
         const p = pendingOf(ex) orelse return;
+        if (p.call.body) |reader| {
+            if (reader.ended) return;
+            p.streamed_len += data.len;
+            if (p.streamed_len > p.found.target.?.max_body) return reader.end(error.PayloadTooLarge);
+            reader.push(data) catch reader.end(error.OutOfMemory);
+            return;
+        }
         const a = p.arena.allocator();
         const len = p.body.items.len + data.len;
         if (len > p.found.target.?.max_body) return fail(p, 413);
@@ -98,6 +113,7 @@ pub const Host = struct {
 
     pub fn onHttpEnd(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
+        if (p.call.body) |reader| return reader.end(null);
         p.call.request.body = p.body.items;
         if (p.found.target.?.runs_on) |r| return spawn(p, r);
         p.found.run(&p.call);
@@ -114,6 +130,7 @@ pub const Host = struct {
         const p = pendingOf(ex) orelse return;
         p.ex = null;
         giveRoom(p, true);
+        if (p.call.body) |reader| reader.end(error.Closed);
         // Still running: cancel it. Otherwise its `done` is on the way.
         if (p.off) |off| {
             if (off.task.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null) off.reaper.end(&off.task);
@@ -291,6 +308,7 @@ pub const Host = struct {
     }
 
     fn release(p: *Pending) void {
+        if (p.call.body) |reader| reader.deinit();
         const gpa = p.arena.child_allocator;
         p.arena.deinit();
         gpa.destroy(p);
