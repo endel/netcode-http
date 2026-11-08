@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Exchange = @import("quic").event_loop.Exchange;
+const Mailbox = @import("quic").Mailbox;
 const context = @import("context.zig");
 const router_mod = @import("router.zig");
 const Router = router_mod.Router;
@@ -34,6 +35,8 @@ pub const Host = struct {
         found: router_mod.Found,
         body: std.ArrayList(u8) = .empty,
         content_length: ?u64,
+        /// A blocking handler's task done, back on the loop.
+        post: Mailbox.Post = .{ .run = doneOffLoop },
     };
 
     pub fn init(gpa: std.mem.Allocator, router: *const Router) Host {
@@ -79,6 +82,7 @@ pub const Host = struct {
     pub fn onHttpEnd(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
         p.req.body = p.body.items;
+        if (p.found.target.?.runs_on) |b| return spawn(p, b);
         p.found.run(&p.req, &p.res);
         if (!p.res.deferred) answer(p);
     }
@@ -86,8 +90,30 @@ pub const Host = struct {
     pub fn onHttpGone(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
         p.ex = null;
-        // Work still offloaded frees it once it answers.
-        if (!p.res.deferred) release(p);
+        // Work still offloaded, or a task still running, frees it once it answers.
+        if (!p.res.deferred and !p.res.off_loop) release(p);
+    }
+
+    /// The handler as a task on `b.io`; its answer comes back through the mailbox.
+    fn spawn(p: *Pending, b: *Router.Blocking) void {
+        const late = p.res.late orelse return fail(p, 503);
+        late.mailbox.expect();
+        p.res.off_loop = true;
+        // Not `io.async`: with no thread free, Threaded runs that here, on the loop.
+        b.group.concurrent(b.io, runOffLoop, .{p}) catch {
+            late.mailbox.forget();
+            p.res.off_loop = false;
+            return fail(p, 503);
+        };
+    }
+
+    fn runOffLoop(p: *Pending) void {
+        p.found.run(&p.req, &p.res);
+        p.res.late.?.mailbox.post(&p.post);
+    }
+
+    fn doneOffLoop(post: *Mailbox.Post) void {
+        answer(@fieldParentPtr("post", post));
     }
 
     fn pendingOf(ex: *Exchange) ?*Pending {

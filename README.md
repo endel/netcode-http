@@ -63,7 +63,8 @@ against local checkouts instead of the pins:
 - An error answers with its status: `error.NotFound` 404, `error.Forbidden`
   403, `error.BadRequest` 400… (`http.statusOf`); any other is 500, logged.
   The first answer stands: one sent before the error isn't replaced.
-- Handlers run on the event loop's thread: they must not block.
+- Handlers run on the event loop's thread: they must not block, unless
+  their scope is `blocking` (below).
 
 ## Routes
 
@@ -141,8 +142,35 @@ says, for a limit known at run time.
 
 ## Work that blocks
 
-A handler runs on its event loop's thread. Work that takes longer goes to
-a `http.Pool`, and its result answers the request back on the loop:
+A handler runs on its event loop's thread. A scope's `blocking(io)` runs its
+handlers as tasks on a `std.Io` instead, off the loop, where they may block:
+a database query, a file read. They do their I/O with `ctx.io`.
+
+```zig
+var threaded: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = .limited(64) });
+defer threaded.deinit(); // after the router's
+
+const api = try router.scope("/api").blocking(threaded.io());
+try api.get("/users/:id", &app, user);
+
+fn user(app: *App, ctx: *http.Context(.{ .params = struct { id: u64 } })) !User {
+    return app.db.fetchUser(ctx.io, ctx.params.id);
+}
+```
+
+- Each request in flight is a task until its handler returns. One the `Io`
+  refuses is 503: with `std.Io.Threaded`, past its `concurrent_limit`.
+- A handler off the loop shares nothing with it: what the loop owns, a
+  game's state say, it must not touch. `before` middleware still runs on
+  the loop.
+- A handler whose client left runs to its end, and its answer is dropped.
+- On the loop, `ctx.io` is `std.Io.failing`: I/O fails there rather than
+  stall the loop.
+- `router.deinit()` waits for its tasks, so the `Io` outlives the router.
+
+For one piece of work rather than a whole route, a handler on the loop
+hands it to a `http.Pool`, and its result answers the request back on the
+loop:
 
 ```zig
 fn upload(app: *App, ctx: *http.Context(.{ .body = []const u8, .max_body = 8 << 20 })) !void {
@@ -151,7 +179,7 @@ fn upload(app: *App, ctx: *http.Context(.{ .body = []const u8, .max_body = 8 << 
 ```
 
 What `compile` returns answers it: a `http.Reply` as it is, anything else as
-JSON, an error with its status. A full pool is 503. The answer comes back
+JSON, an error with its status. A full pool is 503. Both answer back
 through the loop's `quic.Mailbox`, which a server stopping waits for.
 
 ## A listener of its own
@@ -193,7 +221,8 @@ sized or chunked, is gathered before the handler runs, up to the route's
 ## Tests
 
 `http.testing.Client` calls a router's routes through the same `Host` a
-server runs, limits included, without a socket:
+server runs, limits included, without a socket. An answer made off the
+loop, a blocking scope's or offloaded work's, is waited for:
 
 ```zig
 var client: http.testing.Client = .init(std.testing.allocator, &router);

@@ -12,7 +12,8 @@
 //! ```
 //!
 //! Handlers run on the thread that serves the request, inside its event
-//! loop: they must not block it.
+//! loop: they must not block it. A `blocking` scope's run as tasks on a
+//! `std.Io` instead, where they may (`Scope.blocking`).
 
 const std = @import("std");
 const router = @import("router.zig");

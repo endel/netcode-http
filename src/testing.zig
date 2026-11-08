@@ -11,6 +11,8 @@
 const std = @import("std");
 const quic = @import("quic");
 const Exchange = quic.event_loop.Exchange;
+const Loop = quic.event_loop.Xev.Loop;
+const Mailbox = quic.Mailbox;
 const context = @import("context.zig");
 const Router = @import("router.zig").Router;
 const Host = @import("quic.zig").Host;
@@ -35,20 +37,46 @@ pub const Options = struct {
     peer: Address = .{},
 };
 
-/// Answers live until `deinit`.
+/// Answers live until `deinit`. One made off the loop (a `blocking` scope's,
+/// work offloaded) is waited for.
 pub const Client = struct {
     host: Host,
     arena: std.heap.ArenaAllocator,
+    back: ?*Back = null,
+
+    /// Where answers made off the loop come back to: a loop of the client's own.
+    const Back = struct {
+        loop: Loop,
+        mailbox: Mailbox,
+    };
 
     pub fn init(gpa: std.mem.Allocator, router: *const Router) Client {
         return .{ .host = .init(gpa, router), .arena = .init(gpa) };
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.back) |b| {
+            b.mailbox.deinit();
+            b.loop.deinit();
+            self.host.gpa.destroy(b);
+        }
         self.arena.deinit();
     }
 
+    fn backOf(self: *Client) !*Back {
+        if (self.back) |b| return b;
+        const b = try self.host.gpa.create(Back);
+        errdefer self.host.gpa.destroy(b);
+        b.loop = try .init(.{});
+        errdefer b.loop.deinit();
+        b.mailbox = try .init();
+        b.mailbox.loop = &b.loop;
+        self.back = b;
+        return b;
+    }
+
     pub fn request(self: *Client, method: context.Method, target: []const u8, opts: Options) !Answer {
+        const back = try self.backOf();
         var fake: Fake = .{ .arena = self.arena.allocator() };
         const in6: *std.posix.sockaddr.in6 = @ptrCast(@alignCast(&fake.address));
         in6.* = .{ .port = 0, .flowinfo = 0, .addr = opts.peer.bytes, .scope_id = 0 };
@@ -60,11 +88,13 @@ pub const Client = struct {
             .head_only = method == .HEAD,
             .impl = &fake,
             .vtable = &Fake.vtable,
+            .mailbox = &back.mailbox,
         };
         self.host.onHttpHead(&ex);
         if (ex.passed) return .{ .status = null };
         if (ex.answer != .done and opts.body.len > 0) self.host.onHttpBody(&ex, opts.body);
         if (ex.answer != .done) self.host.onHttpEnd(&ex);
+        while (ex.answer != .done and back.mailbox.watching) try back.loop.run(.once);
         if (ex.answer != .done) return error.Unanswered;
         return .{ .status = fake.status, .headers = fake.headers.items, .body = fake.sent.items };
     }

@@ -1,5 +1,5 @@
-//! A router on a listener of its own, its middleware, and work offloaded
-//! to a pool that answers later.
+//! A router on a listener of its own, its middleware, and work done off the
+//! loop: offloaded to a pool, or a blocking scope's handlers on an `Io`.
 
 const std = @import("std");
 const quic = @import("quic");
@@ -173,4 +173,104 @@ test "behind a trusted proxy, each client it names has its own bucket; anyone el
     // Not from the proxy: its own address, whatever it claims.
     const stranger = try c.request(.GET, "/me", .{ .peer = http.Address.parse("192.0.2.1").?, .headers = bob });
     try expectEqualStrings("192.0.2.1", stranger.body);
+}
+
+const Db = struct {
+    loop: std.Thread.Id,
+    pool: ?*http.Pool = null,
+    started: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+
+    fn user(db: *Db, ctx: *http.Context(.{ .params = struct { id: u32 } })) !struct { id: u32, off_loop: bool } {
+        try ctx.io.sleep(.fromMilliseconds(1), .awake);
+        if (ctx.params.id == 0) return error.NotFound;
+        return .{ .id = ctx.params.id, .off_loop = std.Thread.getCurrentId() != db.loop };
+    }
+
+    fn quiet(_: *Db, _: *http.Context(.{})) !void {}
+
+    fn nested(db: *Db, ctx: *http.Context(.{})) !bool {
+        ctx.offload(db.pool.?, noop, .{}) catch |err| return err == error.AlreadyOffLoop;
+        return false;
+    }
+
+    fn noop() void {}
+
+    /// Holds its task until the test releases it.
+    fn slow(db: *Db, ctx: *http.Context(.{})) !void {
+        db.started.set(ctx.io);
+        try db.release.wait(ctx.io);
+        try ctx.text(200, "done");
+    }
+};
+
+/// On the loop, `ctx.io` fails rather than block it.
+fn openOnLoop(ctx: *http.Context(.{})) !bool {
+    const file = std.Io.Dir.cwd().openFile(ctx.io, "build.zig", .{}) catch return true;
+    file.close(ctx.io);
+    return false;
+}
+
+test "a blocking scope's handlers run off the loop, on its Io, and answer as any other" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const pool = try http.Pool.create(gpa, std.testing.io, .{});
+    defer pool.destroy();
+    var db: Db = .{ .loop = std.Thread.getCurrentId(), .pool = pool };
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    const api = try router.scope("/api").blocking(threaded.io());
+    try api.get("/users/:id", &db, Db.user);
+    try api.post("/quiet", &db, Db.quiet);
+    try api.get("/nested", &db, Db.nested);
+    try router.get("/on-loop", {}, openOnLoop);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    try expectEqualStrings("{\"id\":7,\"off_loop\":true}", (try c.get("/api/users/7")).body);
+    try expectEqual(404, (try c.get("/api/users/0")).status.?);
+    try expectEqual(204, (try c.post("/api/quiet", "")).status.?);
+    try expectEqualStrings("true", (try c.get("/api/nested")).body);
+    try expectEqualStrings("true", (try c.get("/on-loop")).body);
+
+    // Another router's blocking routes keep running on their Io once added.
+    var more: http.Router = .init(gpa);
+    try (try more.scope("").blocking(threaded.io())).get("/more/:id", &db, Db.user);
+    try router.scope("/v2").addAll(&more);
+    more.deinit();
+    try expectEqualStrings("{\"id\":3,\"off_loop\":true}", (try c.get("/v2/more/3")).body);
+}
+
+fn fetchInto(port: u16, request: []const u8, buf: []u8, len: *usize) void {
+    len.* = if (fetch(port, request, buf)) |got| got.len else |_| 0;
+}
+
+test "on a server: the loop answers while a blocking handler waits, and an Io with no room is 503" {
+    var threaded: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db: Db = .{ .loop = std.Thread.getCurrentId() };
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("").blocking(io)).get("/slow", &db, Db.slow);
+    try router.get("/hello", {}, hello);
+    const server = try http.Server.create(gpa, &router, .{});
+    defer server.destroy();
+
+    const request = "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    var slow_buf: [1024]u8 = undefined;
+    var slow_len: usize = 0;
+    const first = try std.Thread.spawn(.{}, fetchInto, .{ server.port(), request, &slow_buf, &slow_len });
+    try db.started.wait(io);
+
+    var buf: [1024]u8 = undefined;
+    try expectEqualStrings("hello", bodyOf(try fetch(server.port(), "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf)));
+    try std.testing.expect(std.mem.startsWith(u8, try fetch(server.port(), request, &buf), "HTTP/1.1 503 "));
+
+    db.release.set(io);
+    first.join();
+    try std.testing.expect(std.mem.startsWith(u8, slow_buf[0..slow_len], "HTTP/1.1 200 "));
+    try expectEqualStrings("done", bodyOf(slow_buf[0..slow_len]));
 }

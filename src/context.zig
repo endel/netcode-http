@@ -51,6 +51,8 @@ pub const Response = struct {
     answered: bool = false,
     /// Its answer comes from work offloaded (`Context.offload`).
     deferred: bool = false,
+    /// Its handler runs as a task off the loop (`Scope.blocking`).
+    off_loop: bool = false,
     /// Set by a transport that can answer after the handler returns.
     late: ?Late = null,
 
@@ -126,6 +128,10 @@ pub fn Context(comptime spec: Spec) type {
         response: *Response,
         /// Freed once the request is answered.
         arena: std.mem.Allocator,
+        /// What the handler does its I/O with: its scope's in a `blocking`
+        /// one. On the loop it's `std.Io.failing`, so I/O fails there rather
+        /// than stall the loop; time and randomness from it are zeros.
+        io: std.Io,
 
         pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !void {
             return self.response.setHeader(name, value);
@@ -152,9 +158,11 @@ pub fn Context(comptime spec: Spec) type {
         /// on the loop: a `Reply` as it is, anything else as JSON (204 for
         /// `void`), an error with its status. The request (its arena, body
         /// and params) stays until then, so `args` may point into it. A full
-        /// pool is `error.ServiceUnavailable`.
+        /// pool is `error.ServiceUnavailable`. A handler in a `blocking`
+        /// scope is off the loop already: it calls `func` itself.
         pub fn offload(self: *Self, on: *pool.Pool, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
             const res = self.response;
+            if (res.off_loop) return error.AlreadyOffLoop;
             const late = res.late orelse return error.ServiceUnavailable;
             const J = Offload(func);
             const job = try res.arena.create(J);
