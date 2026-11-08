@@ -2,17 +2,18 @@
 
 ## Errors
 
-A handler's error answers with the status's reason phrase as plain text
-(`statusOf`, `Response.fail`). APIs want:
+**In:** errors answer as RFC 9457 problems, `ctx.problem(status, fmt, args)`
+words a detail, a scope's `errors` answers an app's own from handler and
+middleware alike, and the TypeScript `HttpError` reads a problem's `title`
+and `detail`. Left over:
 
-- A JSON body, RFC 9457 `application/problem+json` or a shape of the app's
-  choosing.
-- A message the handler picks: an error can't carry one in Zig, so
-  something like `return ctx.problem(409, "seat taken")`.
-- A hook from error to answer, so an app maps its own errors without
-  catching them in every handler.
 - Errors in the endpoint contract, so the TypeScript client gets typed
-  error bodies, not just `HttpError` with a status.
+  error bodies (item 7), with a `Problem` type shared by the Zig client.
+- quic-zig's own answers (its static 404, 405 and 400s) stay plain text,
+  so a path no route has gets a text 405 where a route's gets a problem
+  (item 8's own 404 and 405).
+- A format other than problems for every error (`{"error": ...}`), if an
+  app asks: a router-wide formatter `Response.fail` calls.
 
 ## Validation
 

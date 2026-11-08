@@ -68,7 +68,7 @@ pub const Host = struct {
         p.found.rebase(head.target, p.call.request.target);
         ex.user_data = p;
         for (found.middleware()) |m| if (m.before) |before| {
-            before(m.ctx, &p.call) catch |err| router_mod.Found.failWith(&p.call, err);
+            before(m.ctx, &p.call) catch |err| p.found.failWith(&p.call, err);
             if (p.call.response.answered) return answer(p);
         };
         const target = found.target orelse {
@@ -144,7 +144,7 @@ pub const Host = struct {
         if (gate) |g| g.leave();
         // Lost to the deadline or the client: the answer is the reaper's, or nobody's.
         if (off.task.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) == null) {
-            result catch |err| router_mod.Found.failWith(&p.call, err);
+            result catch |err| p.found.failWith(&p.call, err);
         }
         off.task.mailbox.post(&off.done);
     }

@@ -99,7 +99,8 @@ test "a param that doesn't parse, or a handler's error, answers with its status"
     try expectEqual(1, shop.calls); // a param that doesn't parse never reaches the handler
     const closed = try c.get("/closed");
     try expectEqual(503, closed.status.?);
-    try expectEqualStrings("Service Unavailable\n", closed.body);
+    try expectEqualStrings("{\"title\":\"Service Unavailable\",\"status\":503}", closed.body);
+    try expectEqualStrings("application/problem+json", closed.header("content-type").?);
     try expectEqual(500, http.statusOf(error.Unexpected)); // logged, which a test can't take
     const early = try c.get("/early");
     try expectEqual(202, early.status.?);
@@ -227,4 +228,34 @@ test "a handler bound to an endpoint serves its contract" {
     defer c.deinit();
     try expectEqualStrings("{\"best\":12}", (try c.post("/scores", "{\"player\":\"ann\",\"points\":12}")).body);
     try expectEqualStrings("[{\"player\":\"tanks\",\"points\":12}]", (try c.get("/scores/tanks")).body);
+}
+
+fn brokenAtTheDoor(_: ?*const anyopaque, _: *http.Call) !void {
+    return error.SeatBroken;
+}
+
+const Seats = struct {
+    fn take(_: *Seats, ctx: *http.Context(.{ .params = struct { n: u8 } })) !u8 {
+        if (ctx.params.n == 3) return ctx.problem(409, "seat {d} is \"taken\"", .{ctx.params.n});
+        if (ctx.params.n == 4) return error.SeatBroken;
+        return ctx.params.n;
+    }
+};
+
+test "an error answers as a problem: with the handler's detail, or as its scope says" {
+    var seats: Seats = .{};
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    const seated = try r.scope("").errors(&.{.{ .err = error.SeatBroken, .status = 422, .detail = "that seat is broken" }});
+    try seated.get("/seats/:n", &seats, Seats.take);
+    try (try seated.with(&.{.{ .before = brokenAtTheDoor }})).get("/door", {}, ping);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+
+    const taken = try c.get("/seats/3");
+    try expectEqual(409, taken.status.?);
+    try expectEqualStrings("application/problem+json", taken.header("content-type").?);
+    try expectEqualStrings("{\"title\":\"Conflict\",\"status\":409,\"detail\":\"seat 3 is \\\"taken\\\"\"}", taken.body);
+    try expectEqualStrings("{\"title\":\"Unprocessable Content\",\"status\":422,\"detail\":\"that seat is broken\"}", (try c.get("/seats/4")).body);
+    try expectEqual(422, (try c.get("/door")).status.?);
 }

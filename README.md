@@ -63,7 +63,13 @@ against local checkouts instead of the pins:
   `setHeader`); one that doesn't gets 204.
 - An error answers with its status: `error.NotFound` 404, `error.Forbidden`
   403, `error.BadRequest` 400… (`http.statusOf`); any other is 500, logged.
-  The first answer stands: one sent before the error isn't replaced.
+  The answer is an RFC 9457 problem, `application/problem+json`:
+  `{"title":"Not Found","status":404}`. `return ctx.problem(409, "seat {d}
+  taken", .{n})` adds a `detail` the handler words, and a scope's `errors`
+  answers the app's own: `scope.errors(&.{.{ .err = error.SeatTaken,
+  .status = 409, .detail = "seat taken" }})`, whether the handler or any
+  middleware returns it. The first answer stands: one sent before the
+  error isn't replaced.
 - Handlers run on the event loop's thread: they must not block, unless
   their scope is `blocking` (below).
 
@@ -105,7 +111,8 @@ try router.bind(Api.top, &game, top);
 
 `http.endpoint.typescript.write(Api, writer, "game")` writes a client for
 them: `gameApi(base)` with a typed method per endpoint, its types as
-`gameApi.Score`, and `HttpError` for an answer other than 2xx. netcode's
+`gameApi.Score`, and `HttpError` for an answer other than 2xx, with the
+problem's `title` and `detail` when there is one. netcode's
 bindings write it beside a module's glue when its bindings file has
 `pub const http = Api;`.
 

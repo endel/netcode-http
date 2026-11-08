@@ -31,7 +31,7 @@ depends on the API.
 
 Independent of 1.
 
-5. Structured errors: `problem+json`, a message the handler picks, an
+5. **In.** Structured errors: `problem+json`, a message the handler picks, an
    error-to-answer hook.
 6. Validation with field-level messages, through 5's body.
 7. Typed errors in endpoint contracts for the TypeScript client, then

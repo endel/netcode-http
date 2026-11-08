@@ -39,14 +39,20 @@ pub fn write(comptime Api: type, w: *std.Io.Writer, comptime name: []const u8) !
     try w.print(
         \\}}
         \\
-        \\/** An answer other than 2xx: its status and body. */
+        \\/** An answer other than 2xx: its status and body, and its title and detail when it's a problem (RFC 9457). */
         \\export class HttpError extends Error {{
         \\  status: number;
         \\  body: string;
-        \\  constructor(status: number, body: string) {{
-        \\    super(`HTTP ${{status}}: ${{body}}`);
+        \\  title?: string;
+        \\  detail?: string;
+        \\  constructor(status: number, body: string, type?: string | null) {{
+        \\    let problem: {{ title?: string; detail?: string }} = {{}};
+        \\    if (type?.startsWith("application/problem+json")) try {{ problem = JSON.parse(body) ?? {{}}; }} catch {{}}
+        \\    super(`HTTP ${{status}}: ${{problem.detail ?? problem.title ?? body}}`);
         \\    this.status = status;
         \\    this.body = body;
+        \\    this.title = problem.title;
+        \\    this.detail = problem.detail;
         \\  }}
         \\}}
         \\
@@ -59,7 +65,7 @@ pub fn write(comptime Api: type, w: *std.Io.Writer, comptime name: []const u8) !
         \\    const headers = new Headers(init.headers);
         \\    if (body !== undefined) headers.set("content-type", raw ? "application/octet-stream" : "application/json");
         \\    const res = await fetch(url, {{ ...init, method, headers, body: raw ? (body as BodyInit) : JSON.stringify(body) }});
-        \\    if (!res.ok) throw new HttpError(res.status, await res.text());
+        \\    if (!res.ok) throw new HttpError(res.status, await res.text(), res.headers.get("content-type"));
         \\    return answers ? res.json() : undefined;
         \\  }}
         \\  return {{

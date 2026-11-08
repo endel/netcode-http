@@ -22,6 +22,8 @@ const middleware = @import("middleware.zig");
 
 pub const Router = router.Router;
 pub const Scope = router.Scope;
+/// How an app's own error answers (`Scope.errors`).
+pub const ErrorAnswer = router.ErrorAnswer;
 pub const statusOf = context.statusOf;
 
 pub const Context = context.Context;

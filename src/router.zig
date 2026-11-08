@@ -102,7 +102,7 @@ pub const Found = struct {
     /// status; for a method the path takes no route for, OPTIONS gets 204
     /// and the rest 405, both with `Allow`.
     pub fn run(self: *const Found, c: *Call) void {
-        self.call(c) catch |err| failWith(c, err);
+        self.call(c) catch |err| self.failWith(c, err);
     }
 
     /// `run`, leaving a handler's error to the caller (`failWith`).
@@ -112,15 +112,28 @@ pub const Found = struct {
         return rest.run(c);
     }
 
-    /// `err`'s status as the answer.
-    pub fn failWith(c: *Call, err: anyerror) void {
-        const req = &c.request;
+    /// The route's own answer for `err` (`Scope.errors`), or its status
+    /// (`statusOf`), unless something answered already: that stands.
+    pub fn failWith(self: *const Found, c: *Call, err: anyerror) void {
         const res = &c.response;
+        if (res.answered) return;
+        for (self.errors()) |e| if (e.err == err) return res.problem(e.status, e.detail);
         const status = context.statusOf(err);
-        if (status == 500 and !res.answered) log.err("{t} {s}: {t}", .{ req.method, req.path(), err });
+        if (status == 500) log.err("{t} {s}: {t}", .{ c.request.method, c.request.path(), err });
         res.fail(status);
     }
+
+    /// The route's, or for a method the path has no route for, its others'.
+    pub fn errors(self: *const Found) []const ErrorAnswer {
+        if (self.target) |t| return t.errors;
+        for (self.node.targets.values) |t| if (t) |other| return other.errors;
+        return &.{};
+    }
 };
+
+/// How an app's own error answers (`Scope.errors`): as a problem with this
+/// status and detail.
+pub const ErrorAnswer = struct { err: anyerror, status: u16, detail: ?[]const u8 = null };
 
 /// A blocking scope's `max_running` and `max_waiting`.
 pub const Gate = struct {
@@ -183,6 +196,8 @@ pub const Router = struct {
         deadline_ns: ?u64 = null,
         /// How many of its scope's blocking handlers run at once, and wait to.
         gate: ?*Gate = null,
+        /// Its scope's own errors' answers, the innermost scope's first.
+        errors: []const ErrorAnswer = &.{},
     };
     const Entry = struct { method: Method, path: []const u8, target: Target };
 
@@ -340,6 +355,8 @@ pub const Scope = struct {
     runs_on: ?*Reaper = null,
     deadline_ns: ?u64 = null,
     gate: ?*Gate = null,
+    /// Its own errors' answers (`errors`).
+    answers: []const ErrorAnswer = &.{},
 
     pub const BlockingOptions = struct {
         /// A handler that hasn't returned by then is canceled, and the
@@ -378,6 +395,15 @@ pub const Scope = struct {
         return s;
     }
 
+    /// Its routes answer these errors, from the handler or any middleware,
+    /// as problems with their status and detail; others answer with their
+    /// status (`statusOf`). An inner scope's come first.
+    pub fn errors(self: Scope, answers: []const ErrorAnswer) !Scope {
+        var s = self;
+        s.answers = try std.mem.concat(self.router.arena.allocator(), ErrorAnswer, &.{ answers, self.answers });
+        return s;
+    }
+
     /// Its routes have `middleware` too, after the scope's own.
     pub fn with(self: Scope, middleware: []const Middleware) !Scope {
         var s = self;
@@ -406,6 +432,7 @@ pub const Scope = struct {
         for (other.entries.items) |e| {
             var target = e.target;
             target.middleware = try std.mem.concat(a, Middleware, &.{ self.middleware, e.target.middleware });
+            target.errors = try std.mem.concat(a, ErrorAnswer, &.{ e.target.errors, self.answers });
             if (self.max_body) |n| target.max_body = n;
             // Rehomed: `other`'s reaper goes when it does.
             if (self.runs_on orelse e.target.runs_on) |r| target.runs_on = try self.router.reaperFor(r.io);
@@ -442,6 +469,7 @@ pub const Scope = struct {
             .runs_on = self.runs_on,
             .deadline_ns = self.deadline_ns,
             .gate = self.gate,
+            .errors = self.answers,
         });
     }
     pub fn get(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {

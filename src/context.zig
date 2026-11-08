@@ -100,10 +100,18 @@ pub const Response = struct {
         self.sendOwned(r.status, r.content_type, r.body);
     }
 
-    /// `status` with its reason phrase as the body.
+    /// `status` as a problem (RFC 9457) with no more to say than its title.
     pub fn fail(self: *Response, status: u16) void {
+        self.problem(status, null);
+    }
+
+    /// `status` as an RFC 9457 problem: `application/problem+json` with its
+    /// reason phrase as the title, and `detail` when there is one.
+    pub fn problem(self: *Response, status: u16, detail: ?[]const u8) void {
         if (self.answered) return;
-        self.answer(status, "text/plain; charset=utf-8", std.fmt.allocPrint(self.arena, "{s}\n", .{parser.reason(status)}) catch "");
+        const p = .{ .title = parser.reason(status), .status = status, .detail = detail };
+        const body = std.fmt.allocPrint(self.arena, "{f}", .{std.json.fmt(p, .{ .emit_null_optional_fields = false })}) catch "";
+        self.answer(status, "application/problem+json", body);
     }
 
     fn answer(self: *Response, status: u16, content_type: []const u8, body: []const u8) void {
@@ -182,6 +190,13 @@ pub fn Context(comptime spec: Spec) type {
         /// one. On the loop it's `std.Io.failing`, so I/O fails there rather
         /// than stall the loop; time and randomness from it are zeros.
         io: std.Io,
+
+        /// Answers `status` as a problem whose detail is `fmt` with `args`,
+        /// for the handler to return: `return ctx.problem(409, "seat {d} taken", .{n});`.
+        pub fn problem(self: *Self, status: u16, comptime fmt: []const u8, args: anytype) error{Answered} {
+            self.response.problem(status, std.fmt.allocPrint(self.arena, fmt, args) catch null);
+            return error.Answered;
+        }
 
         /// The `T` middleware left (`Call.setLocal`), if any.
         pub fn local(self: *Self, comptime T: type) ?*T {
