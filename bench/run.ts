@@ -48,7 +48,7 @@ const all: Case[] = [
   { proto: "h1", name: "scores (param + query)", path: "/scores/7?limit=10" },
   { proto: "h1", name: "submit (JSON body)", path: "/scores", args: submit },
   { proto: "h1", name: "upload 1 MiB", path: "/upload", args: put, c: 16 },
-  { proto: "h1", name: "upload 1 MiB, offloaded", path: "/upload/offload", args: put, c: 16, bunSkips: true },
+  { proto: "h1", name: "upload 1 MiB, off the loop", path: "/upload/offload", args: put, c: 16, bunSkips: true },
   { proto: "h1", name: "health, a connection each", path: "/health", args: fresh, c: 16 },
   { proto: "tls", name: "health", path: "/health" },
   { proto: "tls", name: "rooms", path: "/rooms/battle", args: origin },

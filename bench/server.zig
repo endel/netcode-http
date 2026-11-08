@@ -23,7 +23,6 @@ const App = struct {
 
     router: http.Router,
     host: http.quic.Host,
-    pool: *http.Pool,
     cors: http.Cors = .{ .origins = &.{"https://game.example"} },
     room_list: [20]Room,
     scores: [100]Score,
@@ -67,18 +66,13 @@ const App = struct {
         return digest(ctx.body);
     }
 
-    fn uploadOffload(self: *App, ctx: *http.Context(upload_spec)) !void {
-        try ctx.offload(self.pool, digest, .{ctx.body});
-    }
-
     fn digest(body: []const u8) Digest {
         return .{ .size = body.len, .hash = std.hash.Wyhash.hash(0, body) };
     }
 
     fn init(self: *App, gpa: std.mem.Allocator, io: std.Io) !void {
-        self.* = .{ .router = .init(gpa), .host = undefined, .pool = undefined, .room_list = undefined, .scores = undefined };
+        self.* = .{ .router = .init(gpa), .host = undefined, .room_list = undefined, .scores = undefined };
         self.host = .init(gpa, &self.router);
-        self.pool = try http.Pool.create(gpa, io, .{ .threads = 1, .max_queued = 1024 });
         for (&self.room_list, 0..) |*r, i| r.* = .{
             .roomId = "x4Gq9-ZbT",
             .name = "battle",
@@ -94,7 +88,7 @@ const App = struct {
         try r.get("/scores/:id", self, top);
         try r.post("/scores", self, submit);
         try r.on(.PUT, "/upload", self, upload);
-        try r.on(.PUT, "/upload/offload", self, uploadOffload);
+        try (try r.scope("").blocking(io, .{})).on(.PUT, "/upload/offload", self, upload);
     }
 };
 

@@ -24,7 +24,8 @@ depends on the API.
 3. **In.** Middleware rework (`api.md`): typed locals handed to the handler,
    middleware around the handler, and `before` on the `io` in blocking
    scopes. One break to the middleware API instead of three.
-4. Retire `Pool` and `ctx.offload`, once 1-3 cover what they're for.
+4. **In.** Retire `Pool` and `ctx.offload`, once 1-3 cover what they're for.
+   netcode has to move off them before its next bump (`blocking.md`).
 
 ### 2. API essentials (`api.md`)
 

@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const parser = @import("quic").http1.parser;
-const pool = @import("pool.zig");
 const json_mod = @import("json.zig");
 const Mailbox = @import("quic").Mailbox;
 const Address = @import("address.zig").Address;
@@ -49,22 +48,6 @@ pub const Response = struct {
     headers: std.ArrayList(Header) = .empty,
     body: []const u8 = "",
     answered: bool = false,
-    /// Its answer comes from work offloaded (`Context.offload`).
-    deferred: bool = false,
-    /// Its handler runs as a task off the loop (`Scope.blocking`).
-    off_loop: bool = false,
-    /// Set by a transport that can answer after the handler returns.
-    late: ?Late = null,
-
-    pub const Late = struct {
-        ctx: *anyopaque,
-        /// The answer is in `Response`: send it, on the loop's thread.
-        send: *const fn (ctx: *anyopaque) void,
-        /// Where offloaded work comes back to.
-        mailbox: *Mailbox,
-        /// From a blocking handler's task: `post` run on the loop's thread.
-        to_loop: *const fn (ctx: *anyopaque, post: *Mailbox.Post) void,
-    };
 
     pub fn init(arena: std.mem.Allocator) Response {
         return .{ .arena = arena };
@@ -73,7 +56,7 @@ pub const Response = struct {
     /// Unanswered again, its headers dropped: for an answer that replaces
     /// whatever was built so far.
     pub fn reset(self: *Response) void {
-        self.* = .{ .arena = self.arena, .late = self.late };
+        self.* = .{ .arena = self.arena };
     }
 
     /// Adds a header to the answer. One that isn't a valid field is
@@ -106,6 +89,17 @@ pub const Response = struct {
         self.answer(status, "application/json", out.written());
     }
 
+    /// `r` as the answer, its body not copied. A header that isn't a valid
+    /// field fails it, keeping only the headers set before.
+    pub fn reply(self: *Response, r: Reply) !void {
+        const kept = self.headers.items.len;
+        for (r.headers) |h| self.setHeader(h.name, h.value) catch |err| {
+            self.headers.shrinkRetainingCapacity(kept);
+            return err;
+        };
+        self.sendOwned(r.status, r.content_type, r.body);
+    }
+
     /// `status` with its reason phrase as the body.
     pub fn fail(self: *Response, status: u16) void {
         if (self.answered) return;
@@ -127,6 +121,10 @@ pub const Call = struct {
     response: Response,
     /// The handler's: a blocking scope's `Io`, `std.Io.failing` on the loop.
     io: std.Io = .failing,
+    /// While a blocking handler runs: its loop's Mailbox (`Context.onLoop`).
+    /// The request's `done` is owed meanwhile, so its watch is on and an
+    /// `expect` off the loop only counts.
+    loop: ?*Mailbox = null,
     /// What middleware left for the handler, one per type, in the arena.
     locals: ?*Local = null,
 
@@ -216,45 +214,25 @@ pub fn Context(comptime spec: Spec) type {
         /// locks. Waits for it; canceled meanwhile, the handler still waits
         /// for `func` to run, then gets `error.Canceled`. On the loop it's a call.
         pub fn onLoop(self: *Self, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) OnLoop(func).Result {
-            const res = self.response;
-            if (!res.off_loop) return @call(.auto, func, args);
+            const loop = self.call.loop orelse return @call(.auto, func, args);
             var job: OnLoop(func) = .{ .args = args, .io = self.io };
-            const late = res.late.?;
-            late.to_loop(late.ctx, &job.post);
+            loop.expect(); // off the loop: see `Call.loop`
+            loop.post(&job.post);
             job.done.wait(self.io) catch |err| {
                 job.done.waitUncancelable(self.io); // `job` is on this stack
                 return err;
             };
             return job.result;
         }
-
-        /// `func(args)` on one of `on`'s threads, whose result answers back
-        /// on the loop: a `Reply` as it is, anything else as JSON (204 for
-        /// `void`), an error with its status. The request (its arena, body
-        /// and params) stays until then, so `args` may point into it. A full
-        /// pool is `error.ServiceUnavailable`. A handler in a `blocking`
-        /// scope is off the loop already: it calls `func` itself.
-        pub fn offload(self: *Self, on: *pool.Pool, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
-            const res = self.response;
-            if (res.off_loop) return error.AlreadyOffLoop;
-            const late = res.late orelse return error.ServiceUnavailable;
-            const J = Offload(func);
-            const job = try res.arena.create(J);
-            job.* = .{ .job = .{ .work = J.work, .post = .{ .run = J.done }, .mailbox = late.mailbox }, .res = res, .args = args };
-            late.mailbox.expect();
-            if (!on.submit(&job.job)) {
-                late.mailbox.forget();
-                return error.ServiceUnavailable;
-            }
-            res.deferred = true;
-        }
     };
 }
 
-/// An answer whole, for offloaded work that picks its own status and body.
+/// An answer whole: what a handler returns to pick its status, type and
+/// headers, rather than answer through its context.
 pub const Reply = struct {
     status: u16,
     content_type: []const u8 = "application/json",
+    /// Not copied: in the request's arena, or outliving it.
     body: []const u8,
     /// Each checked as `Response.setHeader` checks it: one that isn't a
     /// valid field fails the answer with 500.
@@ -285,46 +263,9 @@ fn OnLoop(comptime func: anytype) type {
     };
 }
 
-fn Offload(comptime func: anytype) type {
-    const R = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
-    return struct {
-        job: pool.Job,
-        res: *Response,
-        args: std.meta.ArgsTuple(@TypeOf(func)),
-        result: R = undefined,
-
-        fn work(j: *pool.Job) void {
-            const self: *@This() = @fieldParentPtr("job", j);
-            self.result = @call(.auto, func, self.args);
-        }
-
-        /// On the loop's thread. The job lives in the request's arena,
-        /// which sending the answer frees.
-        fn done(p: *Mailbox.Post) void {
-            const j: *pool.Job = @fieldParentPtr("post", p);
-            const self: *@This() = @fieldParentPtr("job", j);
-            const res = self.res;
-            defer res.late.?.send(res.late.?.ctx);
-            const value = switch (@typeInfo(R)) {
-                .error_union => self.result catch |err| return res.fail(statusOf(err)),
-                else => self.result,
-            };
-            if (@TypeOf(value) == Reply) {
-                for (value.headers) |h| res.setHeader(h.name, h.value) catch {
-                    res.reset();
-                    return res.fail(500);
-                };
-                return res.send(value.status, value.content_type, value.body) catch res.fail(500);
-            }
-            if (@TypeOf(value) != void) res.json(200, value) catch res.fail(500);
-        }
-    };
-}
-
 pub fn isContext(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "web_spec");
 }
-
 
 test "a header that would split the head is refused" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

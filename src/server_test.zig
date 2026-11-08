@@ -1,5 +1,5 @@
-//! A router on a listener of its own, its middleware, and work done off the
-//! loop: offloaded to a pool, or a blocking scope's handlers on an `Io`.
+//! A router on a listener of its own, its middleware, and blocking scopes'
+//! handlers, off the loop on an `Io`.
 
 const std = @import("std");
 const quic = @import("quic");
@@ -10,27 +10,17 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 const gpa = std.testing.allocator;
 
 const Admin = struct {
-    pool: *http.Pool,
-    full: *http.Pool,
-
     fn stats(_: *Admin, _: *http.Context(.{})) !struct { rooms: u32 } {
         return .{ .rooms = 3 };
     }
 
-    /// Sums the body's bytes on a pool thread, as a compile would run.
-    fn sum(self: *Admin, ctx: *http.Context(.{ .body = []const u8, .max_body = 1 << 20 })) !void {
-        try ctx.offload(self.pool, add, .{ctx.body});
-    }
-
-    fn crowded(self: *Admin, ctx: *http.Context(.{})) !void {
-        try ctx.offload(self.full, add, .{""});
-    }
-
-    fn add(bytes: []const u8) !u64 {
-        if (bytes.len == 0) return error.BadRequest;
+    /// Sums the body's bytes, as a compile would run: off the loop, picking
+    /// its own answer.
+    fn sum(_: *Admin, ctx: *http.Context(.{ .body = []const u8, .max_body = 1 << 20 })) !http.Reply {
+        if (ctx.body.len == 0) return error.BadRequest;
         var total: u64 = 0;
-        for (bytes) |b| total += b;
-        return total;
+        for (ctx.body) |b| total += b;
+        return .{ .status = 200, .content_type = "text/plain", .body = try std.fmt.allocPrint(ctx.arena, "{d}", .{total}) };
     }
 };
 
@@ -56,20 +46,17 @@ fn bodyOf(response: []const u8) []const u8 {
     return response[end + 4 ..];
 }
 
-test "a listener of its own: a bearer token guards it, and offloaded work answers from the pool" {
-    const pool = try http.Pool.create(gpa, std.testing.io, .{ .threads = 2 });
-    defer pool.destroy();
-    const full = try http.Pool.create(gpa, std.testing.io, .{ .max_queued = 0 });
-    defer full.destroy();
-    var admin: Admin = .{ .pool = pool, .full = full };
+test "a listener of its own: a bearer token guards it, and a blocking handler picks its answer" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var admin: Admin = .{};
 
     var router: http.Router = .init(gpa);
     defer router.deinit();
     const auth: http.Bearer = .{ .token = "s3cret" };
     const guarded = try router.scope("").with(&.{auth.middleware()});
     try guarded.get("/stats", &admin, Admin.stats);
-    try guarded.post("/sum", &admin, Admin.sum);
-    try guarded.get("/crowded", &admin, Admin.crowded);
+    try (try guarded.blocking(threaded.io(), .{})).post("/sum", &admin, Admin.sum);
 
     const server = try http.Server.create(gpa, &router, .{});
     defer server.destroy();
@@ -83,11 +70,10 @@ test "a listener of its own: a bearer token guards it, and offloaded work answer
     try expectEqualStrings("{\"rooms\":3}", bodyOf(ok));
 
     const summed = try fetch(server.port(), "POST /sum HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\nContent-Length: 3\r\n\r\n\x01\x02\x03", &buf);
+    try std.testing.expect(std.mem.indexOf(u8, summed, "Content-Type: text/plain\r\n") != null);
     try expectEqualStrings("6", bodyOf(summed));
     const empty = try fetch(server.port(), "POST /sum HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", &buf);
     try std.testing.expect(std.mem.startsWith(u8, empty, "HTTP/1.1 400 "));
-    const crowded = try fetch(server.port(), "GET /crowded HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\n\r\n", &buf);
-    try std.testing.expect(std.mem.startsWith(u8, crowded, "HTTP/1.1 503 "));
 }
 
 fn hello(ctx: *http.Context(.{})) !void {
@@ -177,7 +163,6 @@ test "behind a trusted proxy, each client it names has its own bucket; anyone el
 
 const Db = struct {
     loop: std.Thread.Id,
-    pool: ?*http.Pool = null,
     started: std.Io.Event = .unset,
     release: std.Io.Event = .unset,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -189,13 +174,6 @@ const Db = struct {
     }
 
     fn quiet(_: *Db, _: *http.Context(.{})) !void {}
-
-    fn nested(db: *Db, ctx: *http.Context(.{})) !bool {
-        ctx.offload(db.pool.?, noop, .{}) catch |err| return err == error.AlreadyOffLoop;
-        return false;
-    }
-
-    fn noop() void {}
 
     /// Holds its task until the test releases it, or it's canceled.
     fn slow(db: *Db, ctx: *http.Context(.{})) !void {
@@ -218,16 +196,13 @@ fn openOnLoop(ctx: *http.Context(.{})) !bool {
 test "a blocking scope's handlers run off the loop, on its Io, and answer as any other" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const pool = try http.Pool.create(gpa, std.testing.io, .{});
-    defer pool.destroy();
-    var db: Db = .{ .loop = std.Thread.getCurrentId(), .pool = pool };
+    var db: Db = .{ .loop = std.Thread.getCurrentId() };
 
     var router: http.Router = .init(gpa);
     defer router.deinit();
     const api = try router.scope("/api").blocking(threaded.io(), .{});
     try api.get("/users/:id", &db, Db.user);
     try api.post("/quiet", &db, Db.quiet);
-    try api.get("/nested", &db, Db.nested);
     try router.get("/on-loop", {}, openOnLoop);
     var c: http.testing.Client = .init(gpa, &router);
     defer c.deinit();
@@ -235,7 +210,6 @@ test "a blocking scope's handlers run off the loop, on its Io, and answer as any
     try expectEqualStrings("{\"id\":7,\"off_loop\":true}", (try c.get("/api/users/7")).body);
     try expectEqual(404, (try c.get("/api/users/0")).status.?);
     try expectEqual(204, (try c.post("/api/quiet", "")).status.?);
-    try expectEqualStrings("true", (try c.get("/api/nested")).body);
     try expectEqualStrings("true", (try c.get("/on-loop")).body);
 
     // Another router's blocking routes keep running on their Io once added.
@@ -435,4 +409,32 @@ test "in a blocking scope, around middleware runs off the loop with the handler"
 
     try expectEqualStrings("hello", (try c.get("/hello")).body);
     try std.testing.expect(ran_on != std.Thread.getCurrentId());
+}
+
+test "on a server: a scope's max_running holds the rest back, max_waiting of them, then 503" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db: Db = .{ .loop = std.Thread.getCurrentId() };
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("").blocking(io, .{ .max_running = 1, .max_waiting = 1 })).get("/slow", &db, Db.slow);
+    const server = try http.Server.create(gpa, &router, .{});
+    defer server.destroy();
+
+    const request = "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    var bufs: [2][512]u8 = undefined;
+    var lens: [2]usize = .{ 0, 0 };
+    const running = try std.Thread.spawn(.{}, fetchInto, .{ server.port(), request, &bufs[0], &lens[0] });
+    try db.started.wait(io);
+    const waiting = try std.Thread.spawn(.{}, fetchInto, .{ server.port(), request, &bufs[1], &lens[1] });
+    try io.sleep(.fromMilliseconds(200), .awake); // for it to reach the gate
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, try fetch(server.port(), request, &buf), "HTTP/1.1 503 "));
+    db.release.set(io);
+    running.join();
+    waiting.join();
+    for (bufs, lens) |b, n| try expectEqualStrings("done", bodyOf(b[0..n]));
 }

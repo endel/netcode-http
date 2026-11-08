@@ -30,14 +30,14 @@ pub const Host = struct {
     /// A request's own, from its head to its answer.
     const Pending = struct {
         arena: std.heap.ArenaAllocator,
-        /// Null once the client is gone, while offloaded work still holds it.
+        /// Null once the client is gone, while a blocking handler still holds it.
         ex: ?*Exchange,
         call: context.Call,
         found: router_mod.Found,
         body: std.ArrayList(u8) = .empty,
         content_length: ?u64,
-        /// A blocking handler's, once it's started (`res.off_loop`).
-        off: *OffLoop = undefined,
+        /// A blocking handler's, once it's started.
+        off: ?*OffLoop = null,
     };
 
     /// A blocking handler's task, in its request's arena. It posts `done`
@@ -63,7 +63,6 @@ pub const Host = struct {
         p.* = .{ .arena = .init(self.gpa), .ex = ex, .call = .{ .request = head, .response = undefined }, .found = found, .content_length = ex.content_length };
         const a = p.arena.allocator();
         p.call.response = .init(a);
-        if (ex.mailbox) |m| p.call.response.late = .{ .ctx = p, .send = sendLater, .mailbox = m, .to_loop = toLoop };
         p.call.request = copyHead(a, &head) catch return fail(p, 500);
         p.call.request.client = address.clientOf(ex.peerAddress(), head.headers, self.trusted_proxies);
         p.found.rebase(head.target, p.call.request.target);
@@ -95,63 +94,73 @@ pub const Host = struct {
         p.call.request.body = p.body.items;
         if (p.found.target.?.runs_on) |r| return spawn(p, r);
         p.found.run(&p.call);
-        if (!p.call.response.deferred) answer(p);
+        answer(p);
     }
 
     pub fn onHttpGone(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
         p.ex = null;
-        if (p.call.response.off_loop) {
-            // Still running: cancel it. Otherwise its `done` is on the way.
-            const off = p.off;
+        // Still running: cancel it. Otherwise its `done` is on the way.
+        if (p.off) |off| {
             if (off.task.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null) off.reaper.end(&off.task);
             return;
         }
-        // Work still offloaded frees it once it answers.
-        if (!p.call.response.deferred) release(p);
+        release(p);
     }
 
     /// The handler as a task on `r.io`. Two posts come back: `done` when it
     /// returns, `task.reaped` when the reaper has collected it.
     fn spawn(p: *Pending, r: *Reaper) void {
-        const late = p.call.response.late orelse return fail(p, 503);
-        const deadline = p.found.target.?.deadline_ns;
+        const mailbox = p.ex.?.mailbox orelse return fail(p, 503);
+        const target = p.found.target.?;
+        if (target.gate) |g| if (!g.enter()) return fail(p, 503);
         const off = p.arena.allocator().create(OffLoop) catch return fail(p, 500);
         off.* = .{ .p = p, .reaper = r, .task = .{
-            .mailbox = late.mailbox,
+            .mailbox = mailbox,
             .reaped = .{ .run = reapedOffLoop },
-            .deadline = if (deadline) |ns| .fromNow(r.io, .{ .raw = .fromNanoseconds(ns), .clock = .awake }) else null,
+            .deadline = if (target.deadline_ns) |ns| .fromNow(r.io, .{ .raw = .fromNanoseconds(ns), .clock = .awake }) else null,
         } };
-        p.off = off;
-        late.mailbox.expect(); // done
-        late.mailbox.expect(); // task.reaped
-        p.call.response.off_loop = true;
+        mailbox.expect(); // done
+        mailbox.expect(); // task.reaped
         p.call.io = r.io;
+        p.call.loop = mailbox;
         // Not `io.async`: with no thread free, Threaded runs that here, on the loop.
         off.task.future = r.io.concurrent(runOffLoop, .{off}) catch {
-            late.mailbox.forget();
-            late.mailbox.forget();
-            p.call.response.off_loop = false;
+            mailbox.forget();
+            mailbox.forget();
             p.call.io = .failing;
+            p.call.loop = null;
+            if (target.gate) |g| g.leave();
             return fail(p, 503);
         };
-        if (deadline != null) r.arm(&off.task);
+        p.off = off;
+        if (off.task.deadline != null) r.arm(&off.task);
     }
 
     fn runOffLoop(off: *OffLoop) void {
         const p = off.p;
-        const result = p.found.call(&p.call);
+        const gate = p.found.target.?.gate;
+        const result = if (gate) |g| gated(g, p) else p.found.call(&p.call);
+        if (gate) |g| g.leave();
         // Lost to the deadline or the client: the answer is the reaper's, or nobody's.
         if (off.task.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) == null) {
             result catch |err| router_mod.Found.failWith(&p.call, err);
         }
-        p.call.response.late.?.mailbox.post(&off.done);
+        off.task.mailbox.post(&off.done);
+    }
+
+    /// The handler, once one of the gate's runs is free; waiting, it's canceled as it would be running.
+    fn gated(g: *router_mod.Gate, p: *Pending) anyerror!void {
+        try g.running.wait(p.call.io);
+        defer g.running.post(p.call.io);
+        return p.found.call(&p.call);
     }
 
     fn doneOffLoop(post: *Mailbox.Post) void {
         const off: *OffLoop = @alignCast(@fieldParentPtr("done", post));
         const p = off.p;
         p.call.io = .failing; // `after` runs here, on the loop
+        p.call.loop = null;
         switch (off.task.state.load(.acquire)) {
             .running => unreachable,
             .finished => {
@@ -167,15 +176,6 @@ pub const Host = struct {
         }
     }
 
-    /// From the task: `expect` is the loop's, but while the handler runs its
-    /// `done` is owed, so the watch is on and `expect` only counts.
-    fn toLoop(ctx: *anyopaque, post: *Mailbox.Post) void {
-        const p: *Pending = @ptrCast(@alignCast(ctx));
-        const mailbox = p.call.response.late.?.mailbox;
-        mailbox.expect();
-        mailbox.post(post);
-    }
-
     fn reapedOffLoop(post: *Mailbox.Post) void {
         const t: *reaper_mod.Task = @alignCast(@fieldParentPtr("reaped", post));
         const off: *OffLoop = @alignCast(@fieldParentPtr("task", t));
@@ -184,11 +184,6 @@ pub const Host = struct {
 
     fn pendingOf(ex: *Exchange) ?*Pending {
         return @ptrCast(@alignCast(ex.user_data orelse return null));
-    }
-
-    /// Offloaded work's answer, on the loop's thread.
-    fn sendLater(ctx: *anyopaque) void {
-        answer(@ptrCast(@alignCast(ctx)));
     }
 
     fn fail(p: *Pending, status: u16) void {

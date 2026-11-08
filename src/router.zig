@@ -27,15 +27,16 @@ const Route = struct {
     /// only its context.
     App: type,
     Ctx: type,
-    /// What a call returns, sent as JSON; `void` when it answers by itself.
+    /// What a call returns, sent as JSON, or as it is for a `Reply`; `void`
+    /// when it answers by itself.
     Result: type,
     thunk: Thunk,
     max_body: usize,
 };
 
 /// `handler` is `fn (app: *App, ctx: *http.Context(spec)) !Result`, or
-/// without `app`. A `Result` other than `void` is sent as JSON with 200;
-/// with `void` the handler answers through `ctx`, and one that doesn't
+/// without `app`. A `Result` other than `void` is sent as JSON with 200, a
+/// `Reply` as it is; with `void` the handler answers through `ctx`, and one that doesn't
 /// gets 204. An error answers with its status (`statusOf`) unless the
 /// handler answered already.
 fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
@@ -70,7 +71,7 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
             };
             const returned = if (App == void) handler(&ctx) else handler(@as(App, @ptrCast(@alignCast(app.?))), &ctx);
             const result = if (@typeInfo(Returned) == .error_union) try returned else returned;
-            if (Result != void) try c.response.json(200, result);
+            if (Result == context.Reply) try c.response.reply(result) else if (Result != void) try c.response.json(200, result);
         }
     };
     return .{ .App = App, .Ctx = Ctx, .Result = Result, .thunk = S.run, .max_body = Ctx.web_spec.max_body };
@@ -111,15 +112,32 @@ pub const Found = struct {
         return rest.run(c);
     }
 
-    /// `err`'s status as the answer. One after an `offload` leaves the
-    /// answer to the work offloaded.
+    /// `err`'s status as the answer.
     pub fn failWith(c: *Call, err: anyerror) void {
         const req = &c.request;
         const res = &c.response;
-        if (res.deferred) return log.err("{t} {s}: {t} after offload", .{ req.method, req.path(), err });
         const status = context.statusOf(err);
         if (status == 500 and !res.answered) log.err("{t} {s}: {t}", .{ req.method, req.path(), err });
         res.fail(status);
+    }
+};
+
+/// A blocking scope's `max_running` and `max_waiting`.
+pub const Gate = struct {
+    running: std.Io.Semaphore,
+    /// Running and waiting, at most: past it, 503.
+    room: u32,
+    in: std.atomic.Value(u32) = .init(0),
+
+    /// Any loop: false when there's no room.
+    pub fn enter(g: *Gate) bool {
+        if (g.in.fetchAdd(1, .monotonic) < g.room) return true;
+        g.leave();
+        return false;
+    }
+
+    pub fn leave(g: *Gate) void {
+        _ = g.in.fetchSub(1, .monotonic);
     }
 };
 
@@ -163,6 +181,8 @@ pub const Router = struct {
         /// Nanoseconds a blocking handler has before it's canceled and the
         /// answer is 504.
         deadline_ns: ?u64 = null,
+        /// How many of its scope's blocking handlers run at once, and wait to.
+        gate: ?*Gate = null,
     };
     const Entry = struct { method: Method, path: []const u8, target: Target };
 
@@ -319,11 +339,18 @@ pub const Scope = struct {
     /// Where its handlers run, off the loop (`blocking`).
     runs_on: ?*Reaper = null,
     deadline_ns: ?u64 = null,
+    gate: ?*Gate = null,
 
     pub const BlockingOptions = struct {
         /// A handler that hasn't returned by then is canceled, and the
         /// request answered 504. Null: none.
         deadline: ?std.Io.Duration = null,
+        /// At most this many of the scope's handlers at once, whatever the
+        /// `Io` takes. Null: as many as it takes.
+        max_running: ?u32 = null,
+        /// With `max_running`, how many more wait their turn; past them,
+        /// 503. A wait is canceled as running would be.
+        max_waiting: u32 = 64,
     };
 
     /// Its routes' handlers run as tasks on `io`, off the event loop, so
@@ -342,6 +369,12 @@ pub const Scope = struct {
         var s = self;
         s.runs_on = try self.router.reaperFor(io);
         s.deadline_ns = if (opts.deadline) |d| @intCast(@max(d.nanoseconds, 0)) else null;
+        s.gate = null;
+        if (opts.max_running) |n| {
+            const g = try self.router.arena.allocator().create(Gate);
+            g.* = .{ .running = .{ .permits = n }, .room = n + opts.max_waiting };
+            s.gate = g;
+        }
         return s;
     }
 
@@ -368,13 +401,25 @@ pub const Scope = struct {
     /// `other`'s routes, under this scope: its prefix, its middleware first.
     pub fn addAll(self: Scope, other: *const Router) !void {
         const a = self.router.arena.allocator();
+        // `other`'s gates, each copied once, so the routes sharing one still do.
+        var gates: std.ArrayList(struct { from: *Gate, to: *Gate }) = .empty;
         for (other.entries.items) |e| {
             var target = e.target;
             target.middleware = try std.mem.concat(a, Middleware, &.{ self.middleware, e.target.middleware });
             if (self.max_body) |n| target.max_body = n;
             // Rehomed: `other`'s reaper goes when it does.
             if (self.runs_on orelse e.target.runs_on) |r| target.runs_on = try self.router.reaperFor(r.io);
-            if (self.runs_on != null) target.deadline_ns = self.deadline_ns;
+            if (self.runs_on != null) {
+                target.deadline_ns = self.deadline_ns;
+                target.gate = self.gate;
+            } else if (e.target.gate) |from| target.gate = for (gates.items) |g| {
+                if (g.from == from) break g.to;
+            } else copy: {
+                const to = try a.create(Gate);
+                to.* = .{ .running = .{ .permits = from.running.permits }, .room = from.room };
+                try gates.append(a, .{ .from = from, .to = to });
+                break :copy to;
+            };
             try self.router.insert(e.method, try std.mem.concat(a, u8, &.{ self.prefix, e.path }), target);
         }
     }
@@ -396,6 +441,7 @@ pub const Scope = struct {
             .middleware = self.middleware,
             .runs_on = self.runs_on,
             .deadline_ns = self.deadline_ns,
+            .gate = self.gate,
         });
     }
     pub fn get(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {

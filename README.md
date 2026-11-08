@@ -57,9 +57,10 @@ against local checkouts instead of the pins:
   defaults are optional) and `.body` (`[]const u8` as it came, any other
   type from JSON). A param that doesn't parse makes the route not found;
   a query or body that doesn't is 400.
-- A `Result` other than `void` is sent as JSON with 200. With `void` the
-  handler answers through `ctx` (`text`, `json`, `send`, `setHeader`);
-  one that doesn't gets 204.
+- A `Result` other than `void` is sent as JSON with 200, but an
+  `http.Reply`, which is sent as it is: status, type, headers and body.
+  With `void` the handler answers through `ctx` (`text`, `json`, `send`,
+  `setHeader`); one that doesn't gets 204.
 - An error answers with its status: `error.NotFound` 404, `error.Forbidden`
   403, `error.BadRequest` 400… (`http.statusOf`); any other is 500, logged.
   The first answer stands: one sent before the error isn't replaced.
@@ -212,19 +213,9 @@ fn submit(game: *Game, ctx: *http.Context(.{ .body = Score })) !void {
   cancels its tasks. `router.deinit()` stops it, so the `Io` outlives the
   router.
 
-For one piece of work rather than a whole route, a handler on the loop
-hands it to a `http.Pool`, and its result answers the request back on the
-loop:
-
-```zig
-fn upload(app: *App, ctx: *http.Context(.{ .body = []const u8, .max_body = 8 << 20 })) !void {
-    try ctx.offload(app.compiler, compile, .{ app, ctx.body });
-}
-```
-
-What `compile` returns answers it: a `http.Reply` as it is, anything else as
-JSON, an error with its status. A full pool is 503. Both answer back
-through the loop's `quic.Mailbox`, which a server stopping waits for.
+A scope's `max_running` runs fewer at once than the `Io` takes, one compile
+at a time say: `max_waiting` more wait their turn (64 unless it says), the
+rest are 503. A wait is canceled as running would be.
 
 ## A listener of its own
 
@@ -266,7 +257,7 @@ sized or chunked, is gathered before the handler runs, up to the route's
 
 `http.testing.Client` calls a router's routes through the same `Host` a
 server runs, limits included, without a socket. An answer made off the
-loop, a blocking scope's or offloaded work's, is waited for:
+loop, a blocking scope's, is waited for:
 
 ```zig
 var client: http.testing.Client = .init(std.testing.allocator, &router);

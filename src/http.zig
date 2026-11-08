@@ -19,7 +19,6 @@ const std = @import("std");
 const router = @import("router.zig");
 const context = @import("context.zig");
 const middleware = @import("middleware.zig");
-const pool = @import("pool.zig");
 
 pub const Router = router.Router;
 pub const Scope = router.Scope;
@@ -53,9 +52,6 @@ pub const Bearer = middleware.Bearer;
 pub const Cors = middleware.Cors;
 pub const RateLimit = middleware.RateLimit;
 pub const access_log = middleware.access_log;
-
-/// Work that would block a loop, on threads of its own (`Context.offload`).
-pub const Pool = pool.Pool;
 
 /// Serving a router from quic-zig's listeners.
 pub const quic = @import("quic.zig");

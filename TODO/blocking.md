@@ -83,10 +83,17 @@ Evented, later: the app passes a different `io` and handlers don't change.
    loop at the head, where it can refuse before the body is read.
 4. **In:** `ctx.onLoop(func, args)` runs `func` on the loop and waits for
    it, so a blocking handler reaches game state without locks. It calls
-   the Mailbox's `expect` off the loop (`Host.toLoop` says why it's safe).
+   the Mailbox's `expect` off the loop (`Call.loop` says why it's safe).
    A quic-zig `Mailbox.expectWhileOwed`, an atomic add asserting something
    is owed, would make that the Mailbox's promise.
-5. Retire `Pool` and `ctx.offload` once blocking scopes cover their uses.
+5. **In:** `Pool` and `ctx.offload` are gone. A blocking scope's
+   `max_running` and `max_waiting` take the pool's threads and queue, and
+   a handler may return an `http.Reply`. netcode still uses them
+   (`src/wasm/routes.zig`, `src/wasm/upload.zig`), so before it bumps its
+   http pin past this, those routes move into a blocking scope with the
+   pool's numbers, and call what they offloaded directly. The guest can
+   write into `ctx.response` instead of a `Reply`. What `routes.zig` checks
+   first (tally, credit, `pinNewest`) is thread-safe already: no `onLoop`.
 6. Spike zio as the `io`. The question is whether quic-zig's loop thread
    may spawn into it, or needs the queue and wakeup above.
 7. Maybe: handlers as fibers on the loop thread, reading game state and

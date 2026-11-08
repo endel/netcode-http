@@ -40,8 +40,8 @@ pub const Options = struct {
     leave: bool = false,
 };
 
-/// Answers live until `deinit`. One made off the loop (a `blocking` scope's,
-/// work offloaded) is waited for.
+/// Answers live until `deinit`. One made off the loop, a `blocking` scope's,
+/// is waited for.
 pub const Client = struct {
     host: Host,
     arena: std.heap.ArenaAllocator,

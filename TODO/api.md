@@ -68,3 +68,6 @@ Bodies decode as JSON or raw bytes, and answers are JSON. Nothing reads
   (`src/typescript.zig`). It brings Swagger UI and clients in every other
   language.
 - Contracts that also state headers and auth requirements.
+- An endpoint whose `result` is `http.Reply` gets a TypeScript client that
+  parses the body as a `Reply`. Contracts should say "bytes of this type"
+  instead.

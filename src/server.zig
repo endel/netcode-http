@@ -1,7 +1,7 @@
 //! A router on a listener of its own: HTTP/1.1 on a thread and event loop
 //! of their own, for a control or admin port beside a server's public one.
 //! Its handlers may block that thread only as long as its other requests
-//! can wait; longer work goes to a `Pool`.
+//! can wait; longer work goes to a `blocking` scope.
 //!
 //! ```zig
 //! const admin = try http.Server.create(gpa, &router, .{ .port = 4480 });
@@ -66,7 +66,7 @@ pub const Server = struct {
         return self;
     }
 
-    /// Any thread. Work offloaded and still running is waited for.
+    /// Any thread. Blocking handlers still running are waited for.
     pub fn destroy(self: *Server) void {
         self.stop_wake.notify() catch {};
         self.thread.join();
