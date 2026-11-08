@@ -23,14 +23,18 @@ a decl on the struct, and checked by the same decode.
 
 ## Middleware
 
-- `before` gets `*const Request` and a response (`src/middleware.zig`). An
-  auth middleware can't hand the user it found to the handler. Wanted:
-  typed per-request locals that middleware sets and the handler's context
-  reads.
-- Nothing can wrap the handler: time it, map its errors, open and commit a
-  transaction around it. `before` and `after` can't express "around".
-- `before` runs on the loop. On blocking scopes it should run on the `io`
-  (`blocking.md`, phase 3).
+**In:** every hook gets the request's `http.Call`; `call.setLocal(T, value)`
+leaves a value per type for the handler (`ctx.local(T)`); `around` wraps the handler where it runs, on the task in a
+blocking scope; `before` can return an error, answered with its status.
+Left over:
+
+- Locals are looked up by type at run time: a handler asking for one no
+  middleware set gets null, not a compile error. A `Spec` naming the
+  locals it needs could check the scope's middleware when routes are
+  added, if middleware declared what it sets.
+- Writing one means casting `ctx: ?*const anyopaque` by hand, and
+  `@constCast` for state it changes (`RateLimit`). A `Middleware.init(&v)`
+  reading `before`/`around`/`after` off `v`'s type would do the casts.
 
 ## Cookies
 

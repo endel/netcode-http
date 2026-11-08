@@ -45,6 +45,10 @@ pub const address = @import("address.zig");
 pub const Address = address.Address;
 
 pub const Middleware = middleware.Middleware;
+/// A request and its answer, as middleware and the handler share them.
+pub const Call = context.Call;
+/// The way on from `around` middleware.
+pub const Next = middleware.Next;
 pub const Bearer = middleware.Bearer;
 pub const Cors = middleware.Cors;
 pub const RateLimit = middleware.RateLimit;

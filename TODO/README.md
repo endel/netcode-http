@@ -21,7 +21,7 @@ depends on the API.
    reused for streaming.
 2. **In.** `ctx.onLoop(func, args)`. Small, and what makes blocking scopes usable
    for netcode: game state read without locks.
-3. Middleware rework (`api.md`): typed locals handed to the handler,
+3. **In.** Middleware rework (`api.md`): typed locals handed to the handler,
    middleware around the handler, and `before` on the `io` in blocking
    scopes. One break to the middleware API instead of three.
 4. Retire `Pool` and `ctx.offload`, once 1-3 cover what they're for.

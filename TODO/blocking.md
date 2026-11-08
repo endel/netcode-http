@@ -78,7 +78,9 @@ Evented, later: the app passes a different `io` and handlers don't change.
      are registered, `Io`s matched by vtable and userdata, and `addAll`
      rehoming routes. An app-owned `http.Blocking.init(io)` passed to
      `blocking(&b, ...)` would drop all three. Worth it by phase 6.
-3. `before` middleware on the `io` for blocking scopes, so auth can query.
+3. **In,** as `around` middleware, which runs where the handler does: on
+   the task in a blocking scope, so auth can query. `before` stays on the
+   loop at the head, where it can refuse before the body is read.
 4. **In:** `ctx.onLoop(func, args)` runs `func` on the loop and waits for
    it, so a blocking handler reaches game state without locks. It calls
    the Mailbox's `expect` off the loop (`Host.toLoop` says why it's safe).

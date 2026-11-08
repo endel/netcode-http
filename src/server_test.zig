@@ -372,3 +372,67 @@ test "on a server: blocking handlers in parallel update the loop's state one at 
     for (clients) |t| t.join();
     try expectEqual(64, game.score);
 }
+
+const Visitor = struct { name: []const u8 };
+
+/// At the head: who's visiting, left for the handler.
+fn nameVisitor(_: ?*const anyopaque, call: *http.Call) !void {
+    const name = call.request.header("x-visitor") orelse return error.Unauthorized;
+    try call.setLocal(Visitor, .{ .name = name });
+}
+
+/// Around the handler: refuses one visitor, settles another's conflict.
+fn guard(_: ?*const anyopaque, next: http.Next) !void {
+    if (std.mem.eql(u8, next.call.local(Visitor).?.name, "mallory")) return error.Forbidden;
+    next.run() catch |err| switch (err) {
+        error.Conflict => return next.call.response.send(200, "text/plain", "settled"),
+        else => return err,
+    };
+}
+
+fn greet(ctx: *http.Context(.{})) ![]const u8 {
+    const visitor = ctx.local(Visitor).?;
+    if (std.mem.eql(u8, visitor.name, "clash")) return error.Conflict;
+    return visitor.name;
+}
+
+test "middleware leaves locals for the handler, and around it refuses, answers or maps its errors" {
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    const scope = try router.scope("").with(&.{ .{ .before = nameVisitor }, .{ .around = guard } });
+    try scope.get("/greet", {}, greet);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    try expectEqualStrings("\"ann\"", (try greetAs(&c, "ann")).body);
+    try expectEqual(401, (try c.get("/greet")).status.?);
+    try expectEqual(403, (try greetAs(&c, "mallory")).status.?);
+    try expectEqualStrings("settled", (try greetAs(&c, "clash")).body);
+}
+
+fn greetAs(c: *http.testing.Client, name: []const u8) !http.testing.Answer {
+    return c.request(.GET, "/greet", .{ .headers = &.{.{ .name = "X-Visitor", .value = name }} });
+}
+
+/// Around a blocking handler: where does it run?
+fn whereAround(ctx: ?*const anyopaque, next: http.Next) !void {
+    const ran_on: *std.Thread.Id = @ptrCast(@alignCast(@constCast(ctx.?)));
+    ran_on.* = std.Thread.getCurrentId();
+    return next.run();
+}
+
+test "in a blocking scope, around middleware runs off the loop with the handler" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var ran_on: std.Thread.Id = std.Thread.getCurrentId();
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    const scope = try (try router.scope("").blocking(threaded.io(), .{})).with(&.{.{ .ctx = &ran_on, .around = whereAround }});
+    try scope.get("/hello", {}, hello);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    try expectEqualStrings("hello", (try c.get("/hello")).body);
+    try std.testing.expect(ran_on != std.Thread.getCurrentId());
+}

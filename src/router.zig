@@ -13,21 +13,14 @@ const Reaper = @import("reaper.zig").Reaper;
 const Method = context.Method;
 const Request = context.Request;
 const Response = context.Response;
+const Call = context.Call;
 
 const log = std.log.scoped(.http);
 
 pub const max_params = endpoint.max_params;
 
-/// What a route's handler runs with.
-const Call = struct {
-    request: *const Request,
-    response: *Response,
-    /// The `:params`' segments, in the pattern's order, still encoded.
-    captures: []const []const u8,
-    io: std.Io,
-};
-
-const Thunk = *const fn (app: ?*anyopaque, call: *const Call) anyerror!void;
+/// `captures`: the `:params`' segments, in the pattern's order, still encoded.
+const Thunk = *const fn (app: ?*anyopaque, call: *Call, captures: []const []const u8) anyerror!void;
 
 const Route = struct {
     /// The type of the state the handler takes first; `void` when it takes
@@ -63,16 +56,17 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
     const rest = comptime endpoint.catchAll(pattern);
 
     const S = struct {
-        fn run(app: ?*anyopaque, c: *const Call) anyerror!void {
+        fn run(app: ?*anyopaque, c: *Call, captures: []const []const u8) anyerror!void {
             const arena = c.response.arena;
             var ctx: Ctx = .{
-                .params = try endpoint.decodeParams(Ctx.web_spec.params, names, rest, c.captures, arena),
+                .params = try endpoint.decodeParams(Ctx.web_spec.params, names, rest, captures, arena),
                 .query = try endpoint.decodeQuery(Ctx.web_spec.query, c.request.rawQuery(), arena),
                 .body = try endpoint.decodeBody(Ctx.web_spec.body, c.request.body, arena),
-                .request = c.request,
-                .response = c.response,
+                .request = &c.request,
+                .response = &c.response,
                 .arena = arena,
                 .io = c.io,
+                .call = c,
             };
             const returned = if (App == void) handler(&ctx) else handler(@as(App, @ptrCast(@alignCast(app.?))), &ctx);
             const result = if (@typeInfo(Returned) == .error_union) try returned else returned;
@@ -86,7 +80,7 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
 /// `target` null, a path that routes have with other methods.
 pub const Found = struct {
     node: *const Router.Node,
-    target: ?Router.Target,
+    target: ?*const Router.Target,
     /// The `:params`' segments, still encoded: slices of the request's target.
     captures: [max_params][]const u8 = undefined,
     n: usize = 0,
@@ -106,29 +100,46 @@ pub const Found = struct {
     /// Answers `req` into `res`: its route's handler, an error with its
     /// status; for a method the path takes no route for, OPTIONS gets 204
     /// and the rest 405, both with `Allow`.
-    pub fn run(self: *const Found, req: *const Request, res: *Response) void {
-        self.call(req, res) catch |err| failWith(req, res, err);
+    pub fn run(self: *const Found, c: *Call) void {
+        self.call(c) catch |err| failWith(c, err);
     }
 
     /// `run`, leaving a handler's error to the caller (`failWith`).
-    pub fn call(self: *const Found, req: *const Request, res: *Response) anyerror!void {
-        const target = self.target orelse return Router.allow(self.node, req.method, res);
-        const c: Call = .{
-            .request = req,
-            .response = res,
-            .captures = self.captures[0..self.n],
-            .io = if (target.runs_on) |r| r.io else .failing,
-        };
-        return target.thunk(target.app, &c);
+    pub fn call(self: *const Found, c: *Call) anyerror!void {
+        const target = self.target orelse return Router.allow(self.node, c.request.method, &c.response);
+        const rest: Rest = .{ .target = target, .captures = self.captures[0..self.n], .middleware = target.middleware };
+        return rest.run(c);
     }
 
     /// `err`'s status as the answer. One after an `offload` leaves the
     /// answer to the work offloaded.
-    pub fn failWith(req: *const Request, res: *Response, err: anyerror) void {
+    pub fn failWith(c: *Call, err: anyerror) void {
+        const req = &c.request;
+        const res = &c.response;
         if (res.deferred) return log.err("{t} {s}: {t} after offload", .{ req.method, req.path(), err });
         const status = context.statusOf(err);
         if (status == 500 and !res.answered) log.err("{t} {s}: {t}", .{ req.method, req.path(), err });
         res.fail(status);
+    }
+};
+
+/// The way left to a handler: its `around` middleware, then it (`Next`).
+const Rest = struct {
+    target: *const Router.Target,
+    captures: []const []const u8,
+    middleware: []const Middleware,
+
+    fn run(self: *const Rest, c: *Call) anyerror!void {
+        for (self.middleware, 0..) |m, i| if (m.around) |around| {
+            const more: Rest = .{ .target = self.target, .captures = self.captures, .middleware = self.middleware[i + 1 ..] };
+            return around(m.ctx, .{ .call = c, .rest = &more, .run_rest = runErased });
+        };
+        return self.target.thunk(self.target.app, c, self.captures);
+    }
+
+    fn runErased(rest: *const anyopaque, c: *Call) anyerror!void {
+        const self: *const Rest = @ptrCast(@alignCast(rest));
+        return self.run(c);
     }
 };
 
@@ -249,8 +260,10 @@ pub const Router = struct {
     }
 
     /// A GET route answers HEAD too.
-    fn targetOf(node: *const Node, method: Method) ?Target {
-        return node.targets.get(method) orelse if (method == .HEAD) node.targets.get(.GET) else null;
+    fn targetOf(node: *const Node, method: Method) ?*const Target {
+        if (node.targets.getPtrConst(method).*) |*t| return t;
+        if (method == .HEAD) if (node.targets.getPtrConst(.GET).*) |*t| return t;
+        return null;
     }
 
     /// Static segments before params, then a catch-all, trying the next

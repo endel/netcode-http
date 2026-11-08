@@ -1,6 +1,6 @@
 //! What runs around a scope's routes: `before` at the request's head, ahead
-//! of its body and its handler, and `after` on every answer the routes
-//! send, theirs or one a `before` sent.
+//! of its body; `around` the handler, where it runs; and `after` on every
+//! answer the routes send, theirs or one a `before` sent.
 //!
 //! ```zig
 //! const auth: http.Bearer = .{ .token = opts.token };
@@ -11,14 +11,32 @@
 const std = @import("std");
 const sys = @import("quic").sys;
 const context = @import("context.zig");
-const Request = context.Request;
-const Response = context.Response;
+const Call = context.Call;
 
 pub const Middleware = struct {
     ctx: ?*const anyopaque = null,
-    /// An answer sent here (`res.fail`, `res.send`...) stops the request.
-    before: ?*const fn (ctx: ?*const anyopaque, req: *const Request, res: *Response) void = null,
-    after: ?*const fn (ctx: ?*const anyopaque, req: *const Request, res: *Response) void = null,
+    /// At the request's head, on the loop, before its body arrives. An
+    /// answer sent or an error returned (with its status) stops the request.
+    before: ?*const fn (ctx: ?*const anyopaque, call: *Call) anyerror!void = null,
+    /// Around the handler, where it runs: in a blocking scope that's its
+    /// task, so this may block too (`next.call.io`). `next.run()` runs the rest
+    /// of the way, handler included; not calling it stops the request here.
+    around: ?*const fn (ctx: ?*const anyopaque, next: Next) anyerror!void = null,
+    /// On every answer, on the loop.
+    after: ?*const fn (ctx: ?*const anyopaque, call: *Call) void = null,
+};
+
+/// The rest of the way to a route's handler, for `around` middleware.
+pub const Next = struct {
+    call: *Call,
+    /// The router's: what's left of the way.
+    rest: *const anyopaque,
+    run_rest: *const fn (rest: *const anyopaque, call: *Call) anyerror!void,
+
+    /// The `around` middleware left, then the handler.
+    pub fn run(self: Next) anyerror!void {
+        return self.run_rest(self.rest, self.call);
+    }
 };
 
 /// `Authorization: Bearer <token>`, or 401.
@@ -29,13 +47,13 @@ pub const Bearer = struct {
         return .{ .ctx = self, .before = check };
     }
 
-    fn check(ctx: ?*const anyopaque, req: *const Request, res: *Response) void {
+    fn check(ctx: ?*const anyopaque, call: *Call) !void {
         const self: *const Bearer = @ptrCast(@alignCast(ctx.?));
-        const given = req.header("authorization") orelse "";
+        const given = call.request.header("authorization") orelse "";
         const token = if (std.ascii.startsWithIgnoreCase(given, "Bearer ")) given["Bearer ".len..] else "";
         if (sameSecret(token, self.token)) return;
-        res.setHeader("WWW-Authenticate", "Bearer") catch {};
-        res.fail(401);
+        try call.response.setHeader("WWW-Authenticate", "Bearer");
+        return error.Unauthorized;
     }
 };
 
@@ -70,19 +88,22 @@ pub const Cors = struct {
         return false;
     }
 
-    fn check(ctx: ?*const anyopaque, req: *const Request, res: *Response) void {
+    fn check(ctx: ?*const anyopaque, call: *Call) !void {
         const self: *const Cors = @ptrCast(@alignCast(ctx.?));
-        const origin = req.header("origin");
-        if (!self.allows(origin)) return res.send(403, "text/plain", "origin not allowed\n") catch {};
+        const req = &call.request;
+        const res = &call.response;
+        if (!self.allows(req.header("origin"))) return res.send(403, "text/plain", "origin not allowed\n");
         if (req.method != .OPTIONS or req.header("access-control-request-method") == null) return;
-        res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE") catch {};
-        if (req.header("access-control-request-headers")) |h| res.setHeader("Access-Control-Allow-Headers", h) catch {};
-        res.setHeader("Access-Control-Max-Age", "600") catch {};
-        res.send(204, "text/plain", "") catch {};
+        try res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE");
+        if (req.header("access-control-request-headers")) |h| try res.setHeader("Access-Control-Allow-Headers", h);
+        try res.setHeader("Access-Control-Max-Age", "600");
+        try res.send(204, "text/plain", "");
     }
 
-    fn allow(ctx: ?*const anyopaque, req: *const Request, res: *Response) void {
+    fn allow(ctx: ?*const anyopaque, call: *Call) void {
         const self: *const Cors = @ptrCast(@alignCast(ctx.?));
+        const req = &call.request;
+        const res = &call.response;
         if (self.origins == null) return res.setHeader("Access-Control-Allow-Origin", "*") catch {};
         const origin = req.header("origin") orelse return;
         if (!self.allows(origin)) return;
@@ -120,11 +141,11 @@ pub const RateLimit = struct {
         return .{ .ctx = self, .before = check };
     }
 
-    fn check(ctx: ?*const anyopaque, req: *const Request, res: *Response) void {
+    fn check(ctx: ?*const anyopaque, call: *Call) !void {
         const self: *RateLimit = @ptrCast(@alignCast(@constCast(ctx.?)));
-        if (self.take(req.client.bytes, sys.nanoTimestamp())) return;
-        res.setHeader("Retry-After", "1") catch {};
-        res.fail(429);
+        if (self.take(call.request.client.bytes, sys.nanoTimestamp())) return;
+        try call.response.setHeader("Retry-After", "1");
+        return error.TooManyRequests;
     }
 
     fn take(self: *RateLimit, key: [16]u8, now_ns: i64) bool {
@@ -146,8 +167,9 @@ pub const RateLimit = struct {
 /// A line per answer: client, method, target, status and body length.
 pub const access_log: Middleware = .{ .after = logAnswer };
 
-fn logAnswer(_: ?*const anyopaque, req: *const Request, res: *Response) void {
-    std.log.scoped(.http).info("{f} {t} {s} {d} {d}", .{ req.client, req.method, req.target, res.status, res.body.len });
+fn logAnswer(_: ?*const anyopaque, call: *Call) void {
+    const req = &call.request;
+    std.log.scoped(.http).info("{f} {t} {s} {d} {d}", .{ req.client, req.method, req.target, call.response.status, call.response.body.len });
 }
 
 test "a bucket empties, refills with time, and each address has its own" {

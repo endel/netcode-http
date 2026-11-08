@@ -115,9 +115,36 @@ const best = await api.top({ game: "tanks" }, { limit: 3 });
 
 ## Middleware
 
-A scope's `with` runs middleware around its routes: `before` at the
-request's head, ahead of its body (an answer there stops it), and `after`
-on every answer they send.
+A scope's `with` runs middleware around its routes:
+
+- `before(ctx, call)` at the request's head, on the loop, ahead of its body.
+- `around(ctx, next)` the handler, where it runs: in a blocking scope
+  that's its task, so it may block too (`call.io`). `next.run()` runs the
+  rest of the way.
+- `after(ctx, call)` on every answer they send.
+
+An answer sent, or an error returned (answered with its status), stops the
+request where it is. Middleware leaves what it found for the handler, one
+value per type:
+
+```zig
+fn session(ctx: ?*const anyopaque, next: http.Next) !void {
+    const db: *const Db = @ptrCast(@alignCast(ctx.?));
+    const call = next.call;
+    const token = call.request.header("cookie") orelse return error.Unauthorized;
+    try call.setLocal(User, try db.userFor(call.io, token)); // may block, off the loop
+    return next.run();
+}
+
+fn profile(ctx: *http.Context(.{})) !User {
+    return ctx.local(User).?.*;
+}
+
+const api = try (try router.scope("/api").blocking(io, .{})).with(&.{.{ .ctx = &db, .around = session }});
+try api.get("/me", {}, profile);
+```
+
+The built-ins:
 
 ```zig
 const auth: http.Bearer = .{ .token = opts.token };
@@ -169,8 +196,8 @@ fn user(app: *App, ctx: *http.Context(.{ .params = struct { id: u64 } })) !User 
   runs to its end; only the deadline cuts it short.
 - A handler off the loop shares nothing with it: what the loop owns, a
   game's state say, it reaches through `ctx.onLoop(func, args)`, which runs
-  `func` on the loop and waits for what it returns. `before` middleware
-  still runs on the loop.
+  `func` on the loop and waits for what it returns. `around` middleware runs
+  with the handler; `before` and `after` stay on the loop.
 
 ```zig
 fn submit(game: *Game, ctx: *http.Context(.{ .body = Score })) !void {

@@ -120,6 +120,49 @@ pub const Response = struct {
     }
 };
 
+/// A request and its answer on their way through middleware to the handler:
+/// what all of them share.
+pub const Call = struct {
+    request: Request,
+    response: Response,
+    /// The handler's: a blocking scope's `Io`, `std.Io.failing` on the loop.
+    io: std.Io = .failing,
+    /// What middleware left for the handler, one per type, in the arena.
+    locals: ?*Local = null,
+
+    const Local = struct { key: *const anyopaque, value: *anyopaque, next: ?*Local };
+
+    /// Leaves `value` for the handler (`Context.local`), and for middleware
+    /// later on the way; another `T` overwrites it.
+    pub fn setLocal(self: *Call, comptime T: type, value: T) !void {
+        if (self.local(T)) |slot| {
+            slot.* = value;
+            return;
+        }
+        const a = self.response.arena;
+        const slot = try a.create(T);
+        slot.* = value;
+        const l = try a.create(Local);
+        l.* = .{ .key = typeKey(T), .value = slot, .next = self.locals };
+        self.locals = l;
+    }
+
+    /// The `T` middleware left, if any.
+    pub fn local(self: *const Call, comptime T: type) ?*T {
+        var it = self.locals;
+        while (it) |l| : (it = l.next) if (l.key == typeKey(T)) return @ptrCast(@alignCast(l.value));
+        return null;
+    }
+};
+
+/// An address of `T`'s own: what a local is found by.
+fn typeKey(comptime T: type) *const anyopaque {
+    return &struct {
+        const of = T; // the capture makes each T its own struct, and key
+        var key: u8 = 0;
+    }.key;
+}
+
 pub const Spec = endpoint.Spec;
 
 /// A handler's view of its request: `params`, `query` and `body` decoded
@@ -136,10 +179,16 @@ pub fn Context(comptime spec: Spec) type {
         response: *Response,
         /// Freed once the request is answered.
         arena: std.mem.Allocator,
+        call: *Call,
         /// What the handler does its I/O with: its scope's in a `blocking`
         /// one. On the loop it's `std.Io.failing`, so I/O fails there rather
         /// than stall the loop; time and randomness from it are zeros.
         io: std.Io,
+
+        /// The `T` middleware left (`Call.setLocal`), if any.
+        pub fn local(self: *Self, comptime T: type) ?*T {
+            return self.call.local(T);
+        }
 
         pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !void {
             return self.response.setHeader(name, value);
