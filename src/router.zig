@@ -114,14 +114,12 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
 pub const Found = struct {
     node: *const Router.Node,
     target: ?*const Router.Target,
-    /// The `:params`' segments, still encoded: slices of the request's target.
-    captures: [max_params][]const u8 = undefined,
-    n: usize = 0,
+    /// The `:params`' segments, still encoded: where they are in the
+    /// request's target, so they hold in a copy of it too.
+    captures: [max_params]Span = undefined,
+    n: u8 = 0,
 
-    /// Points the captures into `to`, a copy of the target they were found in.
-    pub fn rebase(self: *Found, from: []const u8, to: []const u8) void {
-        for (self.captures[0..self.n]) |*c| c.* = to[c.ptr - from.ptr ..][0..c.len];
-    }
+    const Span = struct { off: u32, len: u32 };
 
     /// The route's, or for a method the path has no route for, its others'.
     pub fn middleware(self: *const Found) []const Middleware {
@@ -140,7 +138,10 @@ pub const Found = struct {
     /// `run`, leaving a handler's error to the caller (`failWith`).
     pub fn call(self: *const Found, c: *Call) anyerror!void {
         const target = self.target orelse return Router.allow(self.node, c.request.method, &c.response);
-        const rest: Rest = .{ .target = target, .captures = self.captures[0..self.n], .middleware = target.middleware };
+        // Slices of the request's target: the one they were found in, or a copy.
+        var captures: [max_params][]const u8 = undefined;
+        for (self.captures[0..self.n], captures[0..self.n]) |s, *out| out.* = c.request.target[s.off..][0..s.len];
+        const rest: Rest = .{ .target = target, .captures = captures[0..self.n], .middleware = target.middleware };
         return rest.run(c);
     }
 
@@ -248,18 +249,20 @@ pub const Router = struct {
         failures: []const endpoint.Failure = &.{},
     };
     /// `method` null: a WebSocket route's.
-    const Entry = struct { method: ?Method, path: []const u8, target: Target };
+    const Entry = struct { method: ?Method, path: []const u8, target: *const Target };
 
+    /// Small, so a lookup reads few cache lines: targets live in the
+    /// router's arena, and a static child's segment beside its pointer.
     pub const Node = struct {
-        segment: []const u8 = "",
-        statics: std.ArrayList(*Node) = .empty,
+        statics: std.ArrayList(Static) = .empty,
         param: ?*Node = null,
         /// `*name`'s: what's left of the path, whatever it holds.
         rest: ?*Node = null,
-        targets: std.EnumArray(Method, ?Target) = .initFill(null),
+        targets: std.EnumArray(Method, ?*const Target) = .initFill(null),
         /// A WebSocket upgrade's route, beside its path's methods'.
-        ws: ?Target = null,
+        ws: ?*const Target = null,
     };
+    const Static = struct { segment: []const u8, node: *Node };
 
     pub fn init(gpa: std.mem.Allocator) Router {
         return .{ .arena = .init(gpa) };
@@ -332,8 +335,11 @@ pub const Router = struct {
         const node = try self.nodeAt(path);
         const slot = if (method) |m| node.targets.getPtr(m) else &node.ws;
         if (slot.* != null) return error.DuplicateRoute;
-        slot.* = target;
-        try self.entries.append(self.arena.allocator(), .{ .method = method, .path = path, .target = target });
+        const a = self.arena.allocator();
+        const t = try a.create(Target);
+        t.* = target;
+        try self.entries.append(a, .{ .method = method, .path = path, .target = t });
+        slot.* = t;
     }
 
     fn nodeAt(self: *Router, path: []const u8) !*Node {
@@ -346,7 +352,7 @@ pub const Router = struct {
     /// Where a WebSocket upgrade to `req`'s path leads; null when no route takes one.
     pub fn findUpgrade(self: *const Router, req: *const Request) ?Found {
         var found = self.lookup(true, req) orelse return null;
-        found.target = &found.node.ws.?;
+        found.target = found.node.ws.?;
         return found;
     }
 
@@ -365,10 +371,10 @@ pub const Router = struct {
             }
             return slot.*.?;
         }
-        for (node.statics.items) |c| if (std.mem.eql(u8, c.segment, seg)) return c;
+        for (node.statics.items) |c| if (std.mem.eql(u8, c.segment, seg)) return c.node;
         const c = try a.create(Node);
-        c.* = .{ .segment = seg };
-        try node.statics.append(a, c);
+        c.* = .{};
+        try node.statics.append(a, .{ .segment = seg, .node = c });
         return c;
     }
 
@@ -381,9 +387,7 @@ pub const Router = struct {
 
     /// A GET route answers HEAD too.
     fn targetOf(node: *const Node, method: Method) ?*const Target {
-        if (node.targets.getPtrConst(method).*) |*t| return t;
-        if (method == .HEAD) if (node.targets.getPtrConst(.GET).*) |*t| return t;
-        return null;
+        return node.targets.get(method) orelse if (method == .HEAD) node.targets.get(.GET) else null;
     }
 
     /// Static segments before params, then a catch-all, trying the next
@@ -398,10 +402,10 @@ pub const Router = struct {
             return catchAll(node, segs, found);
         };
         for (node.statics.items) |c| if (std.mem.eql(u8, c.segment, seg)) {
-            if (match(upgrade, c, rest, found)) |f| return f;
+            if (match(upgrade, c.node, rest, found)) |f| return f;
         };
         if (node.param) |p| if (found.n < max_params) {
-            found.captures[found.n] = seg;
+            found.captures[found.n] = spanOf(segs.buffer, seg);
             found.n += 1;
             if (match(upgrade, p, rest, found)) |f| return f;
             found.n -= 1;
@@ -413,9 +417,14 @@ pub const Router = struct {
     fn catchAll(node: *const Node, segs: std.mem.TokenIterator(u8, .scalar), found: *Found) ?*const Node {
         const r = node.rest orelse return null;
         if (found.n == max_params) return null;
-        found.captures[found.n] = segs.rest();
+        found.captures[found.n] = spanOf(segs.buffer, segs.rest());
         found.n += 1;
         return r;
+    }
+
+    /// Where `part` is in `path`, the request target's start.
+    fn spanOf(path: []const u8, part: []const u8) Found.Span {
+        return .{ .off = @intCast(part.ptr - path.ptr), .len = @intCast(part.len) };
     }
 
     /// 405, or 204 for OPTIONS, with the methods the path takes.
@@ -519,7 +528,7 @@ pub const Scope = struct {
         // `other`'s gates, each copied once, so the routes sharing one still do.
         var gates: std.ArrayList(struct { from: *Gate, to: *Gate }) = .empty;
         for (other.entries.items) |e| {
-            var target = e.target;
+            var target = e.target.*;
             target.middleware = try std.mem.concat(a, Middleware, &.{ self.middleware, e.target.middleware });
             target.errors = try std.mem.concat(a, ErrorAnswer, &.{ e.target.errors, self.answers });
             if (self.max_body) |n| target.max_body = n;

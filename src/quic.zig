@@ -142,7 +142,6 @@ pub const Host = struct {
         p.call.response = .init(a);
         p.call.request = copyHead(a, &head) catch return fail(p, 500);
         p.call.request.client = address.clientOf(ex.peerAddress(), head.headers, self.trusted_proxies);
-        p.found.rebase(head.target, p.call.request.target);
         ex.user_data = p;
         if (p.found.before(&p.call)) return answer(p);
         const target = found.target orelse {

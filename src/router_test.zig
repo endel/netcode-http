@@ -199,6 +199,22 @@ test "a catch-all takes the rest of the path as it came, after static segments a
     try expectEqual(null, (try c.get("/nowhere/a")).status);
 }
 
+test "addAll's routes outlive the router they came from" {
+    var copy: http.Router = .init(std.testing.allocator);
+    defer copy.deinit();
+    {
+        var r: http.Router = .init(std.testing.allocator);
+        defer r.deinit();
+        try r.get("/ping", {}, ping);
+        try r.get("/api/:kind/*rest", {}, game);
+        try copy.scope("/v1").addAll(&r);
+    }
+    var c: http.testing.Client = .init(std.testing.allocator, &copy);
+    defer c.deinit();
+    try expectEqualStrings("pong", (try c.get("/v1/ping")).body);
+    try expectEqualStrings("\"tank:a/b%20c\"", (try c.get("/v1/api/tank/a/b%20c?x=1")).body);
+}
+
 const Score = struct { player: []const u8, points: u32 };
 const ScoreApi = struct {
     pub const top = http.endpoint.get("/scores/:game", .{ .params = struct { game: []const u8 }, .result = []const Score, .errors = &.{.{ .status = 404, .why = "no such game" }} });
