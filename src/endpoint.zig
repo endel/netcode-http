@@ -19,6 +19,7 @@ const std = @import("std");
 const Writer = std.Io.Writer;
 
 pub const typescript = @import("typescript.zig");
+pub const openapi = @import("openapi.zig");
 /// What a decoded value is held to past its type.
 pub const rules = @import("rules.zig");
 
@@ -49,15 +50,55 @@ pub const Endpoint = struct {
     spec: Spec,
     /// The answer, as JSON; `void` for none.
     result: type,
+    /// The errors it answers with, beside those any endpoint may (400, 404, 413...).
+    errors: []const Failure = &.{},
 };
 
-/// What `of` takes: a `Spec`'s fields and the `result`.
+/// An error an endpoint answers with: a `Problem` with this status.
+pub const Failure = struct {
+    status: u16,
+    /// When it's answered: "the seat is taken".
+    why: []const u8 = "",
+};
+
+/// What `e` may answer with beside its result: its `errors`, and those its
+/// spec implies, a 400 for a query or JSON body it refuses and a 404 for
+/// params that may not parse.
+pub fn failures(comptime e: Endpoint) []const Failure {
+    var out = e.errors;
+    const s = e.spec;
+    const refuses = @typeInfo(s.query).@"struct".field_names.len > 0 or (s.body != void and s.body != []const u8);
+    if (refuses and !declares(e, 400)) out = out ++ .{Failure{ .status = 400, .why = "the query or body is refused: its detail says why" }};
+    if (paramsMayFail(s.params) and !declares(e, 404)) out = out ++ .{Failure{ .status = 404, .why = "a path param doesn't parse" }};
+    return out;
+}
+
+fn declares(comptime e: Endpoint, comptime status: u16) bool {
+    for (e.errors) |f| if (f.status == status) return true;
+    return false;
+}
+
+fn paramsMayFail(comptime P: type) bool {
+    if (@hasDecl(P, "rules")) return true;
+    for (@typeInfo(P).@"struct".field_types) |F| if (F != []const u8) return true;
+    return false;
+}
+
+/// An error's answer (RFC 9457), as the server writes it and a client reads it.
+pub const Problem = struct {
+    title: []const u8,
+    status: u16,
+    detail: ?[]const u8 = null,
+};
+
+/// What `of` takes: a `Spec`'s fields, the `result` and the `errors`.
 pub const Shape = struct {
     params: type = struct {},
     query: type = struct {},
     body: type = void,
     max_body: usize = 64 * 1024,
     result: type = void,
+    errors: []const Failure = &.{},
 };
 
 /// An endpoint, its path checked against its params here, where it's declared.
@@ -65,7 +106,7 @@ pub fn of(comptime method: Method, comptime path: []const u8, comptime s: Shape)
     if (catchAll(path)) @compileError(path ++ ": an endpoint's path has no catch-all");
     checkParams(path, paramNames(path), s.params);
     const spec: Spec = .{ .params = s.params, .query = s.query, .body = s.body, .max_body = s.max_body };
-    return .{ .method = method, .path = path, .spec = spec, .result = s.result };
+    return .{ .method = method, .path = path, .spec = spec, .result = s.result, .errors = s.errors };
 }
 
 pub fn get(comptime path: []const u8, comptime s: Shape) Endpoint {
@@ -311,7 +352,15 @@ fn queryDefault(comptime Q: type) ?*const anyopaque {
 }
 
 /// A status other than 2xx, and the body that came with it.
-pub const Status = struct { code: u16, body: []const u8 };
+pub const Status = struct {
+    code: u16,
+    body: []const u8,
+
+    /// The body as a `Problem`, if it is one.
+    pub fn problem(self: Status, arena: std.mem.Allocator) ?Problem {
+        return std.json.parseFromSliceLeaky(Problem, arena, self.body, .{ .ignore_unknown_fields = true }) catch null;
+    }
+};
 
 /// How a call of `e` ended.
 pub fn Answer(comptime e: Endpoint) type {
@@ -445,7 +494,11 @@ test "an answer: the result from a 2xx, the status and its body otherwise" {
     const e = get("/top", .{ .result = []const struct { player: []const u8, points: u32 } });
     const ok = decodeAnswer(e, 200, "[{\"player\":\"ann\",\"points\":3,\"extra\":1}]", arena.allocator());
     try std.testing.expectEqualStrings("ann", ok.ok[0].player);
-    try std.testing.expectEqual(404, decodeAnswer(e, 404, "no", arena.allocator()).status.code);
+    const missing = decodeAnswer(e, 404, "no", arena.allocator()).status;
+    try std.testing.expectEqual(404, missing.code);
+    try std.testing.expectEqual(null, missing.problem(arena.allocator()));
+    const taken = decodeAnswer(e, 409, "{\"title\":\"Conflict\",\"status\":409,\"detail\":\"seat taken\"}", arena.allocator()).status;
+    try std.testing.expectEqualStrings("seat taken", taken.problem(arena.allocator()).?.detail.?);
     try std.testing.expect(decodeAnswer(e, 200, "{", arena.allocator()) == .failed);
     try std.testing.expect(decodeAnswer(post("/x", .{}), 204, "", arena.allocator()) == .ok);
 }
@@ -469,5 +522,6 @@ test "a query decodes into its fields, defaults and optionals filling the gaps" 
 
 test {
     _ = typescript;
+    _ = openapi;
     _ = rules;
 }

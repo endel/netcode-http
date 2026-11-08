@@ -118,6 +118,8 @@ pub const Api = struct {
         .params = struct { game: []const u8 },
         .query = struct { limit: u8 = 10 },
         .result = []const Score,
+        // What it answers with beside the result, as problems.
+        .errors = &.{.{ .status = 404, .why = "no such game" }},
     });
 };
 
@@ -137,6 +139,18 @@ bindings write it beside a module's glue when its bindings file has
 const api = gameApi("https://game.example");
 const best = await api.top({ game: "tanks" }, { limit: 3 });
 ```
+
+A contract's `errors`, and the 400 and 404 its spec implies
+(`endpoint.failures`), become the method's `@throws`. A Zig client reads
+an error's problem with `answer.status.problem(arena)`.
+
+`http.endpoint.openapi.write(Api, writer, .{ .title = "game", .version =
+"1.0.0" })` writes an OpenAPI 3.1 document of the same contracts: an
+operation per endpoint, a schema per named struct with its `rules` as
+`minLength`, `maximum` and the like, and each declared error as an
+`application/problem+json` answer. A type with its own `jsonStringify`
+says what it looks like with `pub const json_schema`, as it does for
+TypeScript with `ts_type`.
 
 ## Middleware
 

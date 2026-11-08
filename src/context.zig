@@ -109,7 +109,7 @@ pub const Response = struct {
     /// reason phrase as the title, and `detail` when there is one.
     pub fn problem(self: *Response, status: u16, detail: ?[]const u8) void {
         if (self.answered) return;
-        const p = .{ .title = parser.reason(status), .status = status, .detail = detail };
+        const p: endpoint.Problem = .{ .title = parser.reason(status), .status = status, .detail = detail };
         const body = std.fmt.allocPrint(self.arena, "{f}", .{std.json.fmt(p, .{ .emit_null_optional_fields = false })}) catch "";
         self.answer(status, "application/problem+json", body);
     }

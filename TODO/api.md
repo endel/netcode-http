@@ -71,10 +71,17 @@ Bodies decode as JSON or raw bytes, and answers are JSON. Nothing reads
 
 ## Contracts
 
-- OpenAPI from `http.endpoint` contracts, beside the TypeScript writer
-  (`src/typescript.zig`). It brings Swagger UI and clients in every other
-  language.
-- Contracts that also state headers and auth requirements.
+**In:** an endpoint's `errors` (the TypeScript method's `@throws`, the Zig
+client's `Status.problem`), and OpenAPI 3.1 from the contracts
+(`endpoint.openapi`), valid under Redocly's minimal rules. Left over:
+
+- Contracts that also state headers and auth requirements (OpenAPI's
+  `security`).
 - An endpoint whose `result` is `http.Reply` gets a TypeScript client that
-  parses the body as a `Reply`. Contracts should say "bytes of this type"
-  instead.
+  parses the body as a `Reply`, and OpenAPI a `Reply` schema. Contracts
+  should say "bytes of this type" instead.
+- Errors are declared, not typed: a TypeScript promise can't type what it
+  rejects with, and the set is open (middleware's 401s, any 500). Typed
+  would be a context that answers only the failures its endpoint names,
+  with a per-endpoint status union for clients. A check at `bind` can't
+  do it: `Scope.errors` and `ctx.problem` pick statuses at run time.

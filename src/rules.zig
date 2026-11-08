@@ -75,8 +75,11 @@ fn broken(comptime F: type, v: F, comptime rule: anytype, arena: Allocator) Allo
     return null;
 }
 
+/// What a rule holds a field to.
+pub const Keyword = enum { min, max, min_len, max_len };
+
 /// Each rule names a field of `T` and something it can hold that field to.
-fn validRules(comptime T: type, comptime R: type) void {
+pub fn validRules(comptime T: type, comptime R: type) void {
     const info = @typeInfo(R).@"struct";
     for (info.field_names, info.field_types) |field, Rule| {
         const at = @typeName(T) ++ ".rules." ++ field;
@@ -84,7 +87,7 @@ fn validRules(comptime T: type, comptime R: type) void {
         const F = @FieldType(T, field);
         const V = if (@typeInfo(F) == .optional) @typeInfo(F).optional.child else F;
         for (@typeInfo(Rule).@"struct".field_names) |k| {
-            switch (std.meta.stringToEnum(enum { min, max, min_len, max_len }, k) orelse @compileError(at ++ ": no rule " ++ k)) {
+            switch (std.meta.stringToEnum(Keyword, k) orelse @compileError(at ++ ": no rule " ++ k)) {
                 .min, .max => if (@typeInfo(V) != .int and @typeInfo(V) != .float) @compileError(at ++ "." ++ k ++ ": not a number"),
                 .min_len, .max_len => if (@typeInfo(V) != .pointer or @typeInfo(V).pointer.size != .slice) @compileError(at ++ "." ++ k ++ ": not a slice"),
             }

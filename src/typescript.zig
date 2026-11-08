@@ -12,23 +12,17 @@
 const std = @import("std");
 const endpoint = @import("endpoint.zig");
 const Endpoint = endpoint.Endpoint;
+const api = @import("api.zig");
+const Record = api.Record;
+const ownName = api.ownName;
 
 /// `<name>Api(base)`, the client of `Api`, returning its methods; the types
 /// they take and answer, as `<name>Api.Score`; and `HttpError`.
 pub fn write(comptime Api: type, w: *std.Io.Writer, comptime name: []const u8) !void {
     @setEvalBranchQuota(1_000_000);
     const ns = name ++ "Api";
-    const eps = comptime endpointsOf(Api);
-    const records = comptime blk: {
-        var list: []const Record = &.{};
-        for (eps) |e| for (.{ e.ep.spec.params, e.ep.spec.query, e.ep.spec.body, e.ep.result }) |T| {
-            list = recordsIn(list, T);
-        };
-        for (list, 0..) |a, i| for (list[i + 1 ..]) |b| if (std.mem.eql(u8, a.name, b.name)) {
-            @compileError("two types cross as " ++ a.name ++ ": " ++ @typeName(a.T) ++ " and " ++ @typeName(b.T));
-        };
-        break :blk list;
-    };
+    const eps = comptime api.endpointsOf(Api);
+    const records = comptime api.recordsOf(eps);
     try w.print(
         \\
         \\/** What `{s}` takes and answers with. */
@@ -71,13 +65,9 @@ pub fn write(comptime Api: type, w: *std.Io.Writer, comptime name: []const u8) !
         \\  return {{
         \\
     , .{ns});
-    inline for (eps) |e| try w.writeAll(comptime "    /** " ++ @tagName(e.ep.method) ++ " " ++ e.ep.path ++ " */\n    " ++ method(e.name, e.ep, ns) ++ ",\n");
+    inline for (eps) |e| try w.writeAll(comptime doc(e.ep) ++ "    " ++ method(e.name, e.ep, ns) ++ ",\n");
     try w.writeAll("  };\n}\n");
 }
-
-const Named = struct { name: []const u8, ep: Endpoint };
-/// A named struct, and its name worked out once.
-const Record = struct { T: type, name: []const u8 };
 
 fn interface(comptime r: Record, comptime ns: []const u8) []const u8 {
     const s = @typeInfo(r.T).@"struct";
@@ -86,13 +76,21 @@ fn interface(comptime r: Record, comptime ns: []const u8) []const u8 {
     return out ++ "  }\n";
 }
 
-fn endpointsOf(comptime Api: type) []const Named {
-    var list: []const Named = &.{};
-    for (@typeInfo(Api).@"struct".decl_names) |d| {
-        const v = @field(Api, d);
-        if (@TypeOf(v) == Endpoint) list = list ++ .{Named{ .name = d, .ep = v }};
-    }
-    return list;
+/// The method's comment: its method and path, and the errors it may answer with.
+fn doc(comptime e: Endpoint) []const u8 {
+    const what = @tagName(e.method) ++ " " ++ e.path;
+    const failures = endpoint.failures(e);
+    if (failures.len == 0) return "    /** " ++ what ++ " */\n";
+    var out: []const u8 = "    /**\n     * " ++ what ++ "\n";
+    for (failures) |f| out = out ++ std.fmt.comptimePrint("     * @throws {{HttpError}} {d}{s}{s}\n", .{ f.status, if (f.why.len > 0) " " else "", commentSafe(f.why) });
+    return out ++ "     */\n";
+}
+
+/// `text` with no `*/` to end a comment early.
+fn commentSafe(comptime text: []const u8) []const u8 {
+    var out: []const u8 = "";
+    for (text, 0..) |c, i| out = out ++ (if (c == '/' and i > 0 and text[i - 1] == '*') "\\/" else &[_]u8{c});
+    return out;
 }
 
 /// `name: (args) => call(...)`: params, then the body, then the query.
@@ -113,12 +111,7 @@ fn method(comptime name: []const u8, comptime e: Endpoint, comptime ns: []const 
 
 /// `/scores/:game` as a template literal's text: `/scores/${...(params.game)}`.
 fn pathTemplate(comptime pattern: []const u8) []const u8 {
-    var out: []const u8 = "";
-    var it = std.mem.tokenizeScalar(u8, pattern, '/');
-    while (it.next()) |seg| {
-        out = out ++ "/" ++ if (seg[0] == ':') "${encodeURIComponent(params." ++ seg[1..] ++ ")}" else seg;
-    }
-    return if (out.len == 0) "/" else out;
+    return api.fillPath(pattern, "${encodeURIComponent(params.", ")}");
 }
 
 fn allOptional(comptime T: type) bool {
@@ -172,40 +165,6 @@ fn arrayOf(comptime T: type, comptime ns: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, inner, ' ') != null) "(" ++ inner ++ ")[]" else inner ++ "[]";
 }
 
-/// A struct's own name, an identifier: none for one made in place
-/// (`score__struct_12`), or of a generic (`Page(Score)`), which crosses
-/// written out. One pass over the type's name.
-fn ownName(comptime T: type) ?[]const u8 {
-    if (@typeInfo(T) != .@"struct" or @typeInfo(T).@"struct".is_tuple) return null;
-    const full = @typeName(T);
-    var start: usize = 0;
-    for (full, 0..) |c, i| switch (c) {
-        '(', ')', '[', ']', '{', '}', '*', '?', ',', ' ' => return null,
-        '.' => start = i + 1,
-        '_' => if (std.mem.startsWith(u8, full[i..], "__struct_")) return null,
-        else => {},
-    };
-    return full[start..];
-}
-
-/// `list` and the named structs `T` reaches, each once. One is listed
-/// before its fields are walked, so a type holding itself ends.
-fn recordsIn(comptime list: []const Record, comptime T: type) []const Record {
-    switch (@typeInfo(T)) {
-        .optional => |o| return recordsIn(list, o.child),
-        .pointer => |p| return recordsIn(list, p.child),
-        .array => |a| return recordsIn(list, a.child),
-        .@"struct" => |s| {
-            if (@hasDecl(T, "jsonStringify")) return list;
-            for (list) |seen| if (seen.T == T) return list;
-            var out = if (ownName(T)) |n| list ++ .{Record{ .T = T, .name = n }} else list;
-            for (s.field_types) |F| out = recordsIn(out, F);
-            return out;
-        },
-        else => return list,
-    }
-}
-
 const Score = struct { player: []const u8, points: u32, mode: enum { solo, team } = .solo, tag: [4]u8 = "none".* };
 const Thread = struct { text: []const u8, replies: []const Thread };
 const TestApi = struct {
@@ -213,6 +172,7 @@ const TestApi = struct {
     pub const submit = endpoint.post("/scores", .{ .body = Score, .result = struct { rank: ?u32 } });
     pub const upload = endpoint.put("/maps/:name", .{ .params = struct { name: []const u8 }, .body = []const u8 });
     pub const thread = endpoint.get("/thread", .{ .result = Thread });
+    pub const claim = endpoint.post("/claim", .{ .errors = &.{ .{ .status = 409, .why = "taken */ already" }, .{ .status = 404 } } });
     pub const not_one = 3;
 };
 
@@ -228,6 +188,7 @@ test "an API's client: an interface per named struct, a method per endpoint" {
         "    upload: (params: { name: string; }, body: string | Uint8Array): Promise<void> => call(\"PUT\", `/maps/${encodeURIComponent(params.name)}`, undefined, body, false, true),",
         "export function gameApi(base: string | URL, init: RequestInit = {}) {",
         "  export interface Thread {\n    text: string;\n    replies: gameApi.Thread[];\n  }\n",
+        "    /**\n     * POST /claim\n     * @throws {HttpError} 409 taken *\\/ already\n     * @throws {HttpError} 404\n     */\n    claim: (): Promise<void>",
     }) |line| {
         if (std.mem.indexOf(u8, ts, line) == null) {
             std.debug.print("missing:\n{s}\n--- in:\n{s}\n", .{ line, ts });

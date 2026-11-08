@@ -35,7 +35,7 @@ Independent of 1.
 5. **In.** Structured errors: `problem+json`, a message the handler picks, an
    error-to-answer hook.
 6. **In.** Validation with field-level messages, through 5's body.
-7. Typed errors in endpoint contracts for the TypeScript client, then
+7. **In.** Typed errors in endpoint contracts for the TypeScript client, then
    OpenAPI, once the error shapes have settled.
 8. Small ones together: `put`/`patch`/`delete` shortcuts, cookies,
    urlencoded forms, an app's own 404 and 405.
