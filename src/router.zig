@@ -387,7 +387,8 @@ pub const Router = struct {
 
     /// A GET route answers HEAD too.
     fn targetOf(node: *const Node, method: Method) ?*const Target {
-        return node.targets.get(method) orelse if (method == .HEAD) node.targets.get(.GET) else null;
+        // By pointer: EnumArray.get copies the whole array to read one slot.
+        return node.targets.getPtrConst(method).* orelse if (method == .HEAD) node.targets.getPtrConst(.GET).* else null;
     }
 
     /// Static segments before params, then a catch-all, trying the next

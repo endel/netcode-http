@@ -59,12 +59,17 @@ Independent of 1.
 
 ### Later, unordered
 
-Per request, after the router's cost was measured against raw quic-zig
-(0.3 µs, 2026-11-08): a bodiless request answered inside its head's
-callback, with no copy of the head (HTTP/3 needs quic-zig to say a
-request's stream ended with its head); `find` writing into the request's
-`Pending`, not copying `Found` three times; a buffer of the `Pending`'s own
-before its arena, whose allocations are atomic in Zig 0.17.
+Per request: the router costs ~0.22 µs over raw quic-zig (baseline mix,
+2026-11-08, down from 0.29 with `Pendings`). Profiled, it's mostly loads
+waiting on request setup's stores: removing one store-then-reload moved
+the wait to the next (finding into the caller's `Found` did just that).
+What would cut the bytes stored: setting only the fields of a kept
+`Pending` that change instead of rewriting all ~464 B; a bodiless request
+answered inside its head's callback, with no copy of the head (HTTP/3
+needs quic-zig to say a request's stream ended with its head); a buffer
+of the `Pending`'s own before its arena, whose allocations are atomic in
+Zig 0.17. A few hundredths of a µs each at most: measure before keeping
+any.
 
 Static files, compression, request IDs, logs and metrics, HTTP/2,
 `web-app.md`, the zio spike (`blocking.md` phase 6), handlers as fibers on
