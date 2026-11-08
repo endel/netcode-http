@@ -484,6 +484,7 @@ test "a WebSocket route is found for an upgrade only, and comes along with addAl
     try r.scope("/v1").addAll(&inner);
 
     const upgrade: http.Request = .{ .method = .GET, .target = "/v1/echo" };
-    try std.testing.expect(r.findUpgrade(&upgrade) != null);
-    try std.testing.expectEqual(null, r.find(&upgrade)); // no method's route
+    var found: http.Found = undefined;
+    try std.testing.expect(r.findUpgrade(&upgrade, &found));
+    try std.testing.expect(!r.find(&upgrade, &found)); // no method's route
 }

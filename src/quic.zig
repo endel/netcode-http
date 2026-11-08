@@ -92,7 +92,8 @@ pub const Host = struct {
     pub fn upgrade(self: *Host, req: *event_loop.WsRequest, path: []const u8) bool {
         const sockets = self.sockets orelse return false;
         const head: context.Request = .{ .method = .GET, .target = path, .headers = req.headers() };
-        const found = self.router.findUpgrade(&head) orelse return false;
+        var found: router_mod.Found = undefined;
+        if (!self.router.findUpgrade(&head, &found)) return false;
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         var call: context.Call = .{ .request = head, .response = .init(arena.allocator()) };
@@ -151,7 +152,8 @@ pub const Host = struct {
         const method = std.meta.stringToEnum(context.Method, ex.method) orelse return ex.pass();
         // Routed on the head's own slices: a request no route has costs nothing.
         const head: context.Request = .{ .method = method, .target = ex.target, .headers = ex.headers };
-        const found = self.router.find(&head) orelse return ex.pass();
+        var found: router_mod.Found = undefined;
+        if (!self.router.find(&head, &found)) return ex.pass();
         const p = self.acquire() catch return ex.abort();
         const arena = p.arena;
         p.* = .{ .arena = arena, .pool = self.pendings, .ex = ex, .call = .{ .request = head, .response = undefined }, .found = found, .content_length = ex.content_length };

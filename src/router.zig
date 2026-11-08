@@ -349,17 +349,20 @@ pub const Router = struct {
         return node;
     }
 
-    /// Where a WebSocket upgrade to `req`'s path leads; null when no route takes one.
-    pub fn findUpgrade(self: *const Router, req: *const Request) ?Found {
-        var found = self.lookup(true, req) orelse return null;
+    /// Where a WebSocket upgrade to `req`'s path leads, into `found`; false
+    /// when no route takes one.
+    pub fn findUpgrade(self: *const Router, req: *const Request, found: *Found) bool {
+        if (!self.lookup(true, req, found)) return false;
         found.target = found.node.ws.?;
-        return found;
+        return true;
     }
 
-    fn lookup(self: *const Router, comptime upgrade: bool, req: *const Request) ?Found {
-        var found: Found = .{ .node = undefined, .target = null };
-        found.node = match(upgrade, &self.root, std.mem.tokenizeScalar(u8, req.path(), '/'), &found) orelse return null;
-        return found;
+    // Into the caller's: a returned Found's copy stalled on stores still in flight.
+    fn lookup(self: *const Router, comptime upgrade: bool, req: *const Request, found: *Found) bool {
+        found.n = 0;
+        found.target = null;
+        found.node = match(upgrade, &self.root, std.mem.tokenizeScalar(u8, req.path(), '/'), found) orelse return false;
+        return true;
     }
 
     fn child(a: std.mem.Allocator, node: *Node, seg: []const u8) !*Node {
@@ -378,11 +381,12 @@ pub const Router = struct {
         return c;
     }
 
-    /// Where `req`'s path and method lead; null when no route has the path.
-    pub fn find(self: *const Router, req: *const Request) ?Found {
-        var found = self.lookup(false, req) orelse return null;
+    /// Where `req`'s path and method lead, into `found`; false when no route
+    /// has the path.
+    pub fn find(self: *const Router, req: *const Request, found: *Found) bool {
+        if (!self.lookup(false, req, found)) return false;
         found.target = targetOf(found.node, req.method);
-        return found;
+        return true;
     }
 
     /// A GET route answers HEAD too.
