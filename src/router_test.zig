@@ -259,3 +259,36 @@ test "an error answers as a problem: with the handler's detail, or as its scope 
     try expectEqualStrings("{\"title\":\"Unprocessable Content\",\"status\":422,\"detail\":\"that seat is broken\"}", (try c.get("/seats/4")).body);
     try expectEqual(422, (try c.get("/door")).status.?);
 }
+
+const Signup = struct {
+    name: []const u8,
+    age: u8,
+    pub const rules = .{ .name = .{ .min_len = 1, .max_len = 16 }, .age = .{ .min = 13 } };
+};
+
+fn signup(_: *http.Context(.{ .body = Signup, .query = struct { page: u8 = 1, sort: enum { name, age } = .name } })) !void {}
+
+/// The detail of the problem `target` answers with `body`.
+fn refusal(c: *http.testing.Client, target: []const u8, body: []const u8) ![]const u8 {
+    const answer = try c.request(.POST, target, .{ .body = body });
+    try expectEqual(400, answer.status.?);
+    const Problem = struct { detail: []const u8 };
+    return (try std.json.parseFromSliceLeaky(Problem, c.arena.allocator(), answer.body, .{ .ignore_unknown_fields = true })).detail;
+}
+
+test "a refused query or body says why: the field, and what it broke" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.post("/signup", {}, signup);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+    const ann = "{\"name\":\"ann\",\"age\":20}";
+
+    try expectEqual(204, (try c.request(.POST, "/signup?sort=age", .{ .body = ann })).status.?);
+    try expectEqualStrings("query.page: not an integer", try refusal(&c, "/signup?page=x", ann));
+    try expectEqualStrings("query.sort: not one of name, age", try refusal(&c, "/signup?sort=size", ann));
+    try expectEqualStrings("body, line 1 column 2: not JSON", try refusal(&c, "/signup", "not json"));
+    try expectEqualStrings("body, line 1 column 11: a required field is missing", try refusal(&c, "/signup", "{\"age\":20}"));
+    try expectEqualStrings("body.name: at least 1 byte long", try refusal(&c, "/signup", "{\"name\":\"\",\"age\":20}"));
+    try expectEqualStrings("body.age: at least 13", try refusal(&c, "/signup", "{\"name\":\"ann\",\"age\":9}"));
+}

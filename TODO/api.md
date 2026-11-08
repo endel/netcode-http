@@ -17,10 +17,16 @@ and `detail`. Left over:
 
 ## Validation
 
-A body or query that doesn't decode is a 400 with nothing in it. Wanted:
-which field failed and why, in the error body above. Then constraints past
-types: length, range, enum, pattern, declared beside the field, perhaps as
-a decl on the struct, and checked by the same decode.
+**In:** a refused query or body says which field and why, in the problem's
+detail; a struct's `rules` (`min`, `max`, `min_len`, `max_len`) and `check`
+hold decoded values past their types (`src/rules.zig`). Left over:
+
+- A missing JSON field is reported by position, not name: std.json's
+  `MissingField` doesn't say which.
+- No `pattern` rule: std has no regex. A `check` covers it meanwhile.
+- One detail per request: the first rule broken, not all of them.
+- The TypeScript client doesn't know the rules; OpenAPI (item 7) could
+  carry them as `minLength`, `maximum` and the like.
 
 ## Middleware
 

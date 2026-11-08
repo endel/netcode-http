@@ -19,6 +19,8 @@ const std = @import("std");
 const Writer = std.Io.Writer;
 
 pub const typescript = @import("typescript.zig");
+/// What a decoded value is held to past its type.
+pub const rules = @import("rules.zig");
 
 pub const Method = enum { GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS };
 
@@ -151,11 +153,13 @@ pub fn decodeParams(comptime P: type, comptime names: []const []const u8, compti
         const text = try percentDecode(arena, captures[i], false);
         @field(p, name) = parseScalar(@FieldType(P, name), text) catch return error.NotFound;
     }
+    if (try rules.check(P, &p, arena) != null) return error.NotFound;
     return p;
 }
 
 /// One pass over `raw`'s pairs; a field takes the first value named for it.
-pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator) !Q {
+/// A query it refuses, `why` (if given) says what's wrong with.
+pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator, why: ?*[]const u8) !Q {
     const s = @typeInfo(Q).@"struct";
     var q: Q = undefined;
     var seen: [s.field_names.len]bool = @splat(false);
@@ -167,7 +171,10 @@ pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator) 
         inline for (s.field_names, s.field_types, 0..) |name, T, i| {
             if (!seen[i] and std.mem.eql(u8, key, name)) {
                 const value = try percentDecode(arena, if (eq < pair.len) pair[eq + 1 ..] else "", true);
-                @field(q, name) = parseScalar(T, value) catch return error.BadRequest;
+                @field(q, name) = parseScalar(T, value) catch {
+                    if (why) |w| w.* = "query." ++ name ++ ": not " ++ comptime kind(T);
+                    return error.BadRequest;
+                };
                 seen[i] = true;
             }
         }
@@ -177,20 +184,64 @@ pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator) 
             d
         else if (@typeInfo(T) == .optional)
             null
-        else
+        else {
+            if (why) |w| w.* = "query." ++ name ++ " is required";
             return error.BadRequest;
+        };
     }
-    return q;
+    return keepsRules(Q, q, "query", arena, why);
 }
 
 /// `body` as `B`: `void` for none, `[]const u8` as it came, any other
-/// type from JSON, unknown fields skipped.
-pub fn decodeBody(comptime B: type, body: []const u8, arena: std.mem.Allocator) !B {
+/// type from JSON, unknown fields skipped. A body it refuses, `why` (if
+/// given) says what's wrong with.
+pub fn decodeBody(comptime B: type, body: []const u8, arena: std.mem.Allocator, why: ?*[]const u8) !B {
     if (B == void) return {};
     if (B == []const u8) return body;
-    return std.json.parseFromSliceLeaky(B, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.BadRequest,
+    var scanner: std.json.Scanner = .initCompleteInput(arena, body);
+    var diagnostics: std.json.Diagnostics = .{};
+    scanner.enableDiagnostics(&diagnostics);
+    const b = std.json.parseFromTokenSourceLeaky(B, arena, &scanner, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (why) |w| w.* = try std.fmt.allocPrint(arena, "body, line {d} column {d}: {s}", .{ diagnostics.getLine(), diagnostics.getColumn(), jsonWhy(err) });
+            return error.BadRequest;
+        },
+    };
+    return keepsRules(B, b, "body", arena, why);
+}
+
+/// `value`, unless it breaks a rule its type has (`rules`).
+fn keepsRules(comptime T: type, value: T, comptime where: []const u8, arena: std.mem.Allocator, why: ?*[]const u8) !T {
+    const broken = try rules.check(T, &value, arena) orelse return value;
+    if (why) |w| w.* = try std.fmt.allocPrint(arena, where ++ "{s}: {s}", .{ broken.at, broken.what });
+    return error.BadRequest;
+}
+
+/// What a value of `T` is, for a query field that didn't parse as one.
+fn kind(comptime T: type) []const u8 {
+    return switch (@typeInfo(T)) {
+        .int => "an integer",
+        .float => "a number",
+        .bool => "true or false",
+        .@"enum" => |e| blk: {
+            var names: []const u8 = "one of ";
+            for (e.field_names, 0..) |f, i| names = names ++ (if (i == 0) "" else ", ") ++ f;
+            break :blk names;
+        },
+        .optional => |o| kind(o.child),
+        else => "valid",
+    };
+}
+
+fn jsonWhy(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SyntaxError, error.UnexpectedEndOfInput => "not JSON",
+        error.MissingField => "a required field is missing",
+        error.DuplicateField => "a field is given twice",
+        error.Overflow, error.InvalidNumber, error.InvalidCharacter => "a number that doesn't fit its field",
+        error.InvalidEnumTag => "not one of the field's values",
+        else => "a value of the wrong type",
     };
 }
 
@@ -361,7 +412,7 @@ test "a call's target, as the server's decoders read it back" {
 
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const q = try decodeQuery(Q, target[std.mem.indexOfScalar(u8, target, '?').? + 1 ..], arena.allocator());
+    const q = try decodeQuery(Q, target[std.mem.indexOfScalar(u8, target, '?').? + 1 ..], arena.allocator(), null);
     try std.testing.expectEqualStrings("ann&lee=+", q.who.?);
     try std.testing.expectEqual(null, q.since);
     try std.testing.expectEqual(.team, q.mode);
@@ -403,16 +454,20 @@ test "a query decodes into its fields, defaults and optionals filling the gaps" 
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const Q = struct { name: []const u8, limit: u32 = 10, mode: ?enum { fast, slow } = null, on: bool = false };
-    const q = try decodeQuery(Q, "name=ann+lee%21&on=1&extra=x&name=bob", arena.allocator());
+    const q = try decodeQuery(Q, "name=ann+lee%21&on=1&extra=x&name=bob", arena.allocator(), null);
     try std.testing.expectEqualStrings("ann lee!", q.name);
     try std.testing.expectEqual(10, q.limit);
     try std.testing.expectEqual(null, q.mode);
     try std.testing.expect(q.on);
-    try std.testing.expectError(error.BadRequest, decodeQuery(Q, "limit=3", arena.allocator()));
-    try std.testing.expectError(error.BadRequest, decodeQuery(Q, "name=a&limit=lots", arena.allocator()));
-    try std.testing.expectEqual(.slow, (try decodeQuery(Q, "name=a&mode=slow", arena.allocator())).mode.?);
+    var why: []const u8 = "";
+    try std.testing.expectError(error.BadRequest, decodeQuery(Q, "limit=3", arena.allocator(), &why));
+    try std.testing.expectEqualStrings("query.name is required", why);
+    try std.testing.expectError(error.BadRequest, decodeQuery(Q, "name=a&limit=lots", arena.allocator(), &why));
+    try std.testing.expectEqualStrings("query.limit: not an integer", why);
+    try std.testing.expectEqual(.slow, (try decodeQuery(Q, "name=a&mode=slow", arena.allocator(), null)).mode.?);
 }
 
 test {
     _ = typescript;
+    _ = rules;
 }

@@ -11,7 +11,8 @@ Surveyed 2026-11-08 against this repo at 882c11d and quic-zig as pinned.
 ## Order of work
 
 Item by item. API breaks go early, before anyone outside netcode
-depends on the API.
+depends on the API. What netcode changes for them before its next bump is
+in `netcode.md`.
 
 ### 1. Finish blocking scopes (`blocking.md`)
 
@@ -25,7 +26,7 @@ depends on the API.
    middleware around the handler, and `before` on the `io` in blocking
    scopes. One break to the middleware API instead of three.
 4. **In.** Retire `Pool` and `ctx.offload`, once 1-3 cover what they're for.
-   netcode has to move off them before its next bump (`blocking.md`).
+   netcode has to move off them before its next bump (`netcode.md`).
 
 ### 2. API essentials (`api.md`)
 
@@ -33,7 +34,7 @@ Independent of 1.
 
 5. **In.** Structured errors: `problem+json`, a message the handler picks, an
    error-to-answer hook.
-6. Validation with field-level messages, through 5's body.
+6. **In.** Validation with field-level messages, through 5's body.
 7. Typed errors in endpoint contracts for the TypeScript client, then
    OpenAPI, once the error shapes have settled.
 8. Small ones together: `put`/`patch`/`delete` shortcuts, cookies,

@@ -34,6 +34,12 @@ const Route = struct {
     max_body: usize,
 };
 
+/// A request its spec refuses: `why` as the problem's detail.
+fn refuse(c: *Call, err: anyerror, why: []const u8) anyerror {
+    if (why.len > 0) c.response.problem(context.statusOf(err), why);
+    return err;
+}
+
 /// `handler` is `fn (app: *App, ctx: *http.Context(spec)) !Result`, or
 /// without `app`. A `Result` other than `void` is sent as JSON with 200, a
 /// `Reply` as it is; with `void` the handler answers through `ctx`, and one that doesn't
@@ -59,10 +65,11 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
     const S = struct {
         fn run(app: ?*anyopaque, c: *Call, captures: []const []const u8) anyerror!void {
             const arena = c.response.arena;
+            var why: []const u8 = "";
             var ctx: Ctx = .{
                 .params = try endpoint.decodeParams(Ctx.web_spec.params, names, rest, captures, arena),
-                .query = try endpoint.decodeQuery(Ctx.web_spec.query, c.request.rawQuery(), arena),
-                .body = try endpoint.decodeBody(Ctx.web_spec.body, c.request.body, arena),
+                .query = endpoint.decodeQuery(Ctx.web_spec.query, c.request.rawQuery(), arena, &why) catch |err| return refuse(c, err, why),
+                .body = endpoint.decodeBody(Ctx.web_spec.body, c.request.body, arena, &why) catch |err| return refuse(c, err, why),
                 .request = &c.request,
                 .response = &c.response,
                 .arena = arena,

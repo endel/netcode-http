@@ -56,7 +56,24 @@ against local checkouts instead of the pins:
   `:name` of the pattern, checked at compile time), `.query` (fields with
   defaults are optional) and `.body` (`[]const u8` as it came, any other
   type from JSON). A param that doesn't parse makes the route not found;
-  a query or body that doesn't is 400.
+  a query or body that doesn't is 400, its detail saying which field and
+  why: `query.limit: not an integer`, `body.name: at least 1 byte long`.
+- Past its type, a struct holds its fields to its `rules`: `min` and
+  `max` for numbers, `min_len` and `max_len` for slices, checked into
+  nested structs and slices of them. Its `check` says what's wrong across
+  fields:
+
+```zig
+const Signup = struct {
+    name: []const u8,
+    age: u8,
+    pub const rules = .{ .name = .{ .min_len = 1, .max_len = 16 }, .age = .{ .min = 13 } };
+    pub fn check(s: Signup) ?[]const u8 {
+        return if (std.mem.eql(u8, s.name, "admin")) "that name is taken" else null;
+    }
+};
+```
+
 - A `Result` other than `void` is sent as JSON with 200, but an
   `http.Reply`, which is sent as it is: status, type, headers and body.
   With `void` the handler answers through `ctx` (`text`, `json`, `send`,
