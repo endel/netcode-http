@@ -99,6 +99,7 @@ pub fn parseNetworks(gpa: std.mem.Allocator, texts: []const []const u8) ![]Netwo
 /// lies left of it may be the client's own invention and is never read. An
 /// entry that isn't an address ends the reading at the last proxy passed.
 pub fn clientOf(peer: *const std.posix.sockaddr.storage, headers: anytype, trusted: []const Network) Address {
+    if (trusted.len == 0) return .fromSockaddr(peer); // no proxies: no header to look for
     var forwarded_for: ?[]const u8 = null;
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) forwarded_for = h.value;

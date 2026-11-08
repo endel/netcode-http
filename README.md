@@ -396,7 +396,9 @@ pub fn onHttpWritable(self: *App, ex: *quic.event_loop.Exchange) void {
 }
 ```
 
-A request gets an arena of its own, freed once it's answered. Its body,
+A request gets an arena of its own, freed once it's answered, or with an
+`http.quic.Pendings` kept per loop (`host.pendings`, as `http.Server` does)
+reset and kept for the next request: no allocation per request. Its body,
 sized or chunked, is gathered before the handler runs, up to the route's
 `.max_body` (64 KiB unless its `Spec` says more); past that it's 413.
 

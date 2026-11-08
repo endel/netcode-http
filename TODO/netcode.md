@@ -29,3 +29,6 @@ the commits that changed these. Then:
   `.middleware()` is unchanged.
 - **quic-zig, once:** it can take quic-zig from `http.module("quic")` and
   drop its own pin, so a bump of this package is the only one.
+- **Request state, kept:** a `http.quic.Pendings` per loop beside its
+  `Sockets`, as `host.pendings`, saves an allocation and free per request.
+  Optional; without it nothing changes.

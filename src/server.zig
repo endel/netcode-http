@@ -16,6 +16,7 @@ const event_loop = quic.event_loop;
 const xev = event_loop.Xev;
 const Router = @import("router.zig").Router;
 const Host = @import("quic.zig").Host;
+const Pendings = @import("quic.zig").Pendings;
 const address = @import("address.zig");
 const Sockets = @import("websocket.zig").Sockets;
 
@@ -24,6 +25,8 @@ pub const Server = struct {
     host: Host,
     /// Its WebSocket routes' sockets.
     sockets: Sockets = .{},
+    /// Its requests' state, between them.
+    pendings: Pendings = .{},
     /// The latest a drain may run to, in nanoseconds: `drain`'s grace, or
     /// the past for `destroy`'s stop.
     drain_until: std.atomic.Value(i64) = .init(0),
@@ -71,6 +74,7 @@ pub const Server = struct {
         };
         errdefer self.wake.deinit();
         self.host.sockets = &self.sockets;
+        self.host.pendings = &self.pendings;
         const loop = if (opts.tls) |tls| tls: {
             self.mode = .{ .tls = .{ .app = .{ .host = &self.host }, .server = undefined } };
             const t = &self.mode.tls;
@@ -139,6 +143,7 @@ pub const Server = struct {
             .tls => |*t| t.server.deinit(),
         }
         self.sockets.deinit(self.gpa);
+        self.pendings.deinit();
         self.timer.deinit();
         self.wake.deinit();
     }

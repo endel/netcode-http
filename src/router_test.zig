@@ -215,6 +215,16 @@ test "addAll's routes outlive the router they came from" {
     try expectEqualStrings("\"tank:a/b%20c\"", (try c.get("/v1/api/tank/a/b%20c?x=1")).body);
 }
 
+test "a request's state is kept for the next one" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.get("/ping", {}, ping);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+    for (0..3) |_| try expectEqualStrings("pong", (try c.get("/ping")).body);
+    try expectEqual(1, c.pendings.len);
+}
+
 const Score = struct { player: []const u8, points: u32 };
 const ScoreApi = struct {
     pub const top = http.endpoint.get("/scores/:game", .{ .params = struct { game: []const u8 }, .result = []const Score, .errors = &.{.{ .status = 404, .why = "no such game" }} });

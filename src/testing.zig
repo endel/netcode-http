@@ -16,6 +16,7 @@ const Mailbox = quic.Mailbox;
 const context = @import("context.zig");
 const Router = @import("router.zig").Router;
 const Host = @import("quic.zig").Host;
+const Pendings = @import("quic.zig").Pendings;
 const getHeader = quic.http1.parser.getHeader;
 const Address = @import("address.zig").Address;
 
@@ -48,6 +49,8 @@ pub const Client = struct {
     host: Host,
     arena: std.heap.ArenaAllocator,
     back: ?*Back = null,
+    /// Requests' state, reused as a server's is.
+    pendings: Pendings = .{},
 
     /// Where answers made off the loop come back to: a loop of the client's own.
     const Back = struct {
@@ -65,6 +68,7 @@ pub const Client = struct {
             b.loop.deinit();
             self.host.gpa.destroy(b);
         }
+        self.pendings.deinit();
         self.arena.deinit();
     }
 
@@ -82,6 +86,7 @@ pub const Client = struct {
 
     pub fn request(self: *Client, method: context.Method, target: []const u8, opts: Options) !Answer {
         const back = try self.backOf();
+        self.host.pendings = &self.pendings; // here: the client may have moved since init
         var fake: Fake = .{ .arena = self.arena.allocator() };
         const in6: *std.posix.sockaddr.in6 = @ptrCast(@alignCast(&fake.address));
         in6.* = .{ .port = 0, .flowinfo = 0, .addr = opts.peer.bytes, .scope_id = 0 };

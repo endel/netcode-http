@@ -33,10 +33,16 @@ pub const Host = struct {
     /// since a `Host` may live no longer than a callback. Without one, an
     /// upgrade is declined.
     sockets: ?*websocket.Sockets = null,
+    /// Where requests' state is kept between them: the app's, one per loop,
+    /// as `sockets` is. Without one, each request's is allocated and freed.
+    pendings: ?*Pendings = null,
 
     /// A request's own, from its head to its answer.
     const Pending = struct {
         arena: std.heap.ArenaAllocator,
+        /// Where `release` returns it.
+        pool: ?*Pendings,
+        next: ?*Pending = null,
         /// Null once the client is gone, while a blocking handler still holds it.
         ex: ?*Exchange,
         call: context.Call,
@@ -47,7 +53,17 @@ pub const Host = struct {
         off: ?*OffLoop = null,
         /// A streamed body's bytes so far, against `max_body`.
         streamed_len: usize = 0,
+
+        fn destroy(p: *Pending) void {
+            const gpa = p.arena.child_allocator;
+            p.arena.deinit();
+            gpa.destroy(p);
+        }
     };
+
+    comptime {
+        std.debug.assert(@sizeOf(Pending) <= 512); // smp_allocator's 512 B class, one per request in flight
+    }
 
     /// From here quic-zig's HTTP/1.1 and HTTP/3 alike owe `onHttpWritable`:
     /// their own marks, copied (TODO/streaming.md).
@@ -136,8 +152,9 @@ pub const Host = struct {
         // Routed on the head's own slices: a request no route has costs nothing.
         const head: context.Request = .{ .method = method, .target = ex.target, .headers = ex.headers };
         const found = self.router.find(&head) orelse return ex.pass();
-        const p = self.gpa.create(Pending) catch return ex.abort();
-        p.* = .{ .arena = .init(self.gpa), .ex = ex, .call = .{ .request = head, .response = undefined }, .found = found, .content_length = ex.content_length };
+        const p = self.acquire() catch return ex.abort();
+        const arena = p.arena;
+        p.* = .{ .arena = arena, .pool = self.pendings, .ex = ex, .call = .{ .request = head, .response = undefined }, .found = found, .content_length = ex.content_length };
         const a = p.arena.allocator();
         p.call.response = .init(a);
         p.call.request = copyHead(a, &head) catch return fail(p, 500);
@@ -303,7 +320,8 @@ pub const Host = struct {
         if (!res.streamed) {
             res.streamed = true;
             res.answered = true;
-            try ex.sendHead(res.status, try headOf(p), null);
+            var one: [1]context.Header = undefined;
+            try ex.sendHead(res.status, try headOf(p, &one), null);
         }
         // One write, one chunk, for what fits here: an event is a handful of pieces.
         var buf: [4096]u8 = undefined;
@@ -358,24 +376,74 @@ pub const Host = struct {
         const ex = p.ex orelse return;
         ex.user_data = null;
         const res = &p.call.response;
-        ex.respond(res.status, headOf(p) catch return ex.abort(), res.body);
+        var one: [1]context.Header = undefined;
+        ex.respond(res.status, headOf(p, &one) catch return ex.abort(), res.body);
     }
 
-    /// The answer's headers, `after` middleware's included, its Content-Type first when it has one.
-    fn headOf(p: *Pending) ![]const context.Header {
+    /// The answer's headers, `after` middleware's included, its Content-Type
+    /// first when it has one. Only Content-Type: in `one`, which the
+    /// transport encodes before returning, as it does all of them.
+    fn headOf(p: *Pending, one: *[1]context.Header) ![]const context.Header {
         for (p.found.middleware()) |m| if (m.after) |after| after(m.ctx, &p.call);
         const res = &p.call.response;
+        if (res.headers.items.len == 0) {
+            one[0] = .{ .name = "Content-Type", .value = res.content_type orelse return &.{} };
+            return one;
+        }
         const headers = try p.arena.allocator().alloc(context.Header, res.headers.items.len + 1);
         headers[0] = .{ .name = "Content-Type", .value = res.content_type orelse "" };
         @memcpy(headers[1..], res.headers.items);
         return if (res.content_type == null) headers[1..] else headers;
     }
 
+    /// A request's state: one released before, its arena kept, or a new one.
+    fn acquire(self: *Host) !*Pending {
+        if (self.pendings) |pool| if (pool.pop()) |p| return p;
+        const p = try self.gpa.create(Pending);
+        p.arena = .init(self.gpa);
+        return p;
+    }
+
+    /// Only once nothing holds it: a blocking handler's task is reaped first.
     fn release(p: *Pending) void {
         if (p.call.body) |reader| reader.deinit();
-        const gpa = p.arena.child_allocator;
-        p.arena.deinit();
-        gpa.destroy(p);
+        if (p.pool) |pool| if (pool.keep(p)) return;
+        p.destroy();
+    }
+};
+
+/// Requests' state, kept between them so a request costs no allocation
+/// (`Host.pendings`). The app keeps it, one per loop: a `Host` may live no
+/// longer than a callback. The Hosts sharing one share their `gpa`.
+pub const Pendings = struct {
+    free: ?*Host.Pending = null,
+    len: u32 = 0,
+    /// At most this many kept; past it, a request's state is freed.
+    max: u32 = 256,
+
+    /// What each keeps of its arena: past it, a large request's memory is freed.
+    const kept_bytes = 8 * 1024 - 64; // with the arena's header, inside smp_allocator's 8 KiB class
+
+    /// Once its server has stopped, every request released.
+    pub fn deinit(self: *Pendings) void {
+        while (self.pop()) |p| p.destroy();
+    }
+
+    fn pop(self: *Pendings) ?*Host.Pending {
+        const p = self.free orelse return null;
+        self.free = p.next;
+        self.len -= 1;
+        return p;
+    }
+
+    /// False when it's full: the caller frees `p`.
+    fn keep(self: *Pendings, p: *Host.Pending) bool {
+        if (self.len == self.max) return false;
+        _ = p.arena.reset(.{ .retain_with_limit = kept_bytes });
+        p.next = self.free;
+        self.free = p;
+        self.len += 1;
+        return true;
     }
 };
 
@@ -383,8 +451,10 @@ pub const Host = struct {
 fn copyHead(a: std.mem.Allocator, head: *const context.Request) !context.Request {
     var size = head.target.len;
     for (head.headers) |h| size += h.name.len + h.value.len;
-    var bytes = try a.alloc(u8, size);
-    const headers = try a.alloc(context.Header, head.headers.len);
+    const array = head.headers.len * @sizeOf(context.Header);
+    const block = try a.alignedAlloc(u8, .of(context.Header), array + size);
+    const headers = std.mem.bytesAsSlice(context.Header, block[0..array]);
+    var bytes: []u8 = block[array..];
     const target = take(&bytes, head.target);
     for (head.headers, headers) |h, *out| out.* = .{ .name = take(&bytes, h.name), .value = take(&bytes, h.value) };
     return .{ .method = head.method, .target = target, .headers = headers };
