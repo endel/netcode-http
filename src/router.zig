@@ -161,6 +161,7 @@ pub const Found = struct {
         for (self.errors()) |e| if (e.err == err) return res.problem(e.status, e.detail);
         const status = context.statusOf(err);
         if (status == 500) log.err("{t} {s}: {t}", .{ c.request.method, c.request.path(), err });
+        if (self.target) |t| for (t.failures) |f| if (f.status == status and f.why.len > 0) return res.problem(status, f.why);
         res.fail(status);
     }
 
@@ -243,6 +244,8 @@ pub const Router = struct {
         streams_body: bool = false,
         /// A WebSocket route's hooks, its handler the upgrade's `open` (`Scope.ws`).
         ws_hooks: ?*const websocket.Hooks = null,
+        /// Its endpoint's declared errors (`bind`): their `why` is the detail of an error with their status.
+        failures: []const endpoint.Failure = &.{},
     };
     /// `method` null: a WebSocket route's.
     const Entry = struct { method: ?Method, path: []const u8, target: Target };
@@ -538,11 +541,17 @@ pub const Scope = struct {
     }
 
     pub fn on(self: Scope, comptime method: Method, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        return self.add(method, pattern, app, handler, &.{});
+    }
+
+    fn add(self: Scope, comptime method: Method, comptime pattern: []const u8, app: anytype, comptime handler: anytype, failures: []const endpoint.Failure) !void {
         // A streamed body is read while it arrives: by a handler off the loop.
         const streams = comptime route(pattern, handler).Ctx.web_spec.body == endpoint.BodyStream;
         if (streams and self.runs_on == null) return error.BodyStreamNotBlocking;
+        var target = self.targetFor(pattern, app, handler);
+        target.failures = failures;
         const path = try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, pattern });
-        return self.router.insert(method, path, self.targetFor(pattern, app, handler));
+        return self.router.insert(method, path, target);
     }
 
     /// A WebSocket route: an upgrade to `pattern` goes through the scope's
@@ -620,7 +629,7 @@ pub const Scope = struct {
         const r = comptime route(e.path, handler);
         if (r.Ctx != ContextOf(e)) @compileError(e.path ++ ": a handler bound to it takes *http.ContextOf(its endpoint)");
         if (r.Result != e.result) @compileError(e.path ++ ": its handler returns " ++ @typeName(r.Result) ++ ", not the endpoint's " ++ @typeName(e.result));
-        return self.on(e.method, e.path, app, handler);
+        return self.add(e.method, e.path, app, handler, e.errors);
     }
 };
 

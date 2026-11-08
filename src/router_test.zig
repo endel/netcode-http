@@ -201,7 +201,7 @@ test "a catch-all takes the rest of the path as it came, after static segments a
 
 const Score = struct { player: []const u8, points: u32 };
 const ScoreApi = struct {
-    pub const top = http.endpoint.get("/scores/:game", .{ .params = struct { game: []const u8 }, .result = []const Score });
+    pub const top = http.endpoint.get("/scores/:game", .{ .params = struct { game: []const u8 }, .result = []const Score, .errors = &.{.{ .status = 404, .why = "no such game" }} });
     pub const submit = http.endpoint.post("/scores", .{ .body = Score, .result = struct { best: u32 } });
 };
 
@@ -209,6 +209,7 @@ const Board = struct {
     best: u32 = 0,
 
     fn top(board: *Board, ctx: *http.ContextOf(ScoreApi.top)) ![]const Score {
+        if (std.mem.eql(u8, ctx.params.game, "chess")) return error.NotFound;
         return try ctx.arena.dupe(Score, &.{.{ .player = ctx.params.game, .points = board.best }});
     }
 
@@ -218,7 +219,7 @@ const Board = struct {
     }
 };
 
-test "a handler bound to an endpoint serves its contract" {
+test "a handler bound to an endpoint serves its contract, its errors' why their detail" {
     var board: Board = .{};
     var r: http.Router = .init(std.testing.allocator);
     defer r.deinit();
@@ -228,6 +229,7 @@ test "a handler bound to an endpoint serves its contract" {
     defer c.deinit();
     try expectEqualStrings("{\"best\":12}", (try c.post("/scores", "{\"player\":\"ann\",\"points\":12}")).body);
     try expectEqualStrings("[{\"player\":\"tanks\",\"points\":12}]", (try c.get("/scores/tanks")).body);
+    try expectEqualStrings("{\"title\":\"Not Found\",\"status\":404,\"detail\":\"no such game\"}", (try c.get("/scores/chess")).body);
 }
 
 fn brokenAtTheDoor(_: ?*const anyopaque, _: *http.Call) !void {
