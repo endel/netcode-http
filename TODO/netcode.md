@@ -20,6 +20,10 @@ the commits that changed these. Then:
   reads one.
 - **`Host.onHttpWritable`** wants forwarding from an embedding handler, as
   `onHttpGone` is, for blocking handlers' streams.
+- **WebSocket routes**, if it takes any: its `Host` needs `.sockets`, an
+  `http.Sockets` kept per loop beside the handler, and its `onWsUpgrade`,
+  `onWsMessage` and `onWsClose` try `host.upgrade`, `message` and `closed`
+  first, its own sockets after.
 - **Custom middleware** takes `*http.Call` (`before`, `after`) and
   `http.Next` (`around`). netcode only uses the built-ins, whose
   `.middleware()` is unchanged.

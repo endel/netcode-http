@@ -47,7 +47,8 @@ Independent of 1.
 10. **In.** Streaming request bodies (bounded by `max_body` until quic-zig's
     `Exchange` can pause one, `streaming.md`), then multipart on top, into
     `.form` bodies with `File` fields.
-11. WebSocket and WebTransport routes, so 3's middleware runs on upgrades.
+11. **Half in.** WebSocket routes are in; WebTransport's waits on a way to
+    test it (`streaming.md`). WebSocket and WebTransport routes, so 3's middleware runs on upgrades.
 
 ### 4. Standing alone (`server.md`, `packaging.md`)
 

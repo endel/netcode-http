@@ -298,6 +298,44 @@ alive through proxies. Each holds a blocking task for as long as it's
 open, so it suits a few clients each; a game pushing to many wants a
 stream written from the loop, which isn't here yet (TODO/streaming.md).
 
+## WebSockets
+
+A scope's `ws(pattern, app, H)` is a WebSocket route. The upgrade goes
+through the scope's middleware and `H.open`, an ordinary handler (params,
+query, `ctx.call` locals) that accepts by returning and refuses with an
+error, its status the answer. Then, on the loop:
+
+```zig
+const Chat = struct {
+    pub fn open(room: *Room, ctx: *http.Context(.{ .params = struct { id: u32 } })) !void {
+        if (!room.has(ctx.params.id)) return error.NotFound;
+    }
+    pub fn ready(room: *Room, ws: *http.WebSocket, call: *http.Call) void { ... }
+    pub fn message(room: *Room, ws: *http.WebSocket, data: []const u8, kind: http.WebSocket.Kind) void { ... }
+    pub fn close(room: *Room, ws: *http.WebSocket, code: u16, reason: []const u8) void { ... }
+};
+try (try router.scope("").with(&.{auth.middleware()})).ws("/rooms/:id", &room, Chat);
+```
+
+`ready` and `close` may be left out. `ws.data` holds what the app keeps
+per socket; `ws.send`, `sendText` and `close` answer it.
+
+An app embedding the `Host` keeps an `http.Sockets` per loop (its
+`host.sockets`) and hands upgrades and messages on. Each says whether it
+was a route's, so the app's own sockets go on as before:
+
+```zig
+pub fn onWsUpgrade(self: *App, req: *quic.event_loop.WsRequest, path: []const u8) void {
+    if (!self.host.upgrade(req, path)) self.ownUpgrade(req, path);
+}
+pub fn onWsMessage(self: *App, ws: *quic.event_loop.WsConn, data: []const u8, kind: http.WebSocket.Kind) void {
+    if (!self.host.message(ws, data, kind)) self.ownMessage(ws, data, kind);
+}
+pub fn onWsClose(self: *App, ws: *quic.event_loop.WsConn, code: u16, reason: []const u8) void {
+    if (!self.host.closed(ws, code, reason)) self.ownClose(ws, code, reason);
+}
+```
+
 ## A listener of its own
 
 `http.Server` serves a router on an HTTP/1.1 listener of its own, with a

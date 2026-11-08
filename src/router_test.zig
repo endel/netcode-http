@@ -438,3 +438,24 @@ fn refusalAsPut(c: *http.testing.Client, target: []const u8, headers: []const ht
     const Problem = struct { detail: []const u8 };
     return (try std.json.parseFromSliceLeaky(Problem, c.arena.allocator(), answer.body, .{ .ignore_unknown_fields = true })).detail;
 }
+
+const Echo = struct {
+    pub fn open(_: *http.Context(.{})) !void {}
+    pub fn message(ws: *http.WebSocket, data: []const u8, _: http.WebSocket.Kind) void {
+        ws.send(data) catch {};
+    }
+};
+
+test "a WebSocket route is found for an upgrade only, and comes along with addAll" {
+    var inner: http.Router = .init(std.testing.allocator);
+    defer inner.deinit();
+    try inner.ws("/echo", {}, Echo);
+    try std.testing.expectError(error.DuplicateRoute, inner.ws("/echo", {}, Echo));
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.scope("/v1").addAll(&inner);
+
+    const upgrade: http.Request = .{ .method = .GET, .target = "/v1/echo" };
+    try std.testing.expect(r.findUpgrade(&upgrade) != null);
+    try std.testing.expectEqual(null, r.find(&upgrade)); // no method's route
+}

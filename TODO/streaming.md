@@ -45,8 +45,22 @@ endpoint's contract that the TypeScript client reads with `EventSource`.
 
 ## WebSocket and WebTransport routes
 
-quic-zig serves both: WebSockets on HTTP/1.1 (`onWsUpgrade`, `onWsMessage`,
-`onWsClose`) and WebTransport on HTTP/3. None of it goes through the router,
-so a scope's middleware (auth, CORS, rate limit) doesn't apply to an
-upgrade. Wanted: `router.ws("/chat", app, handler)`, with the scope's
-`before` middleware run on the upgrade request, and a test client for it.
+**In:** `Scope.ws(pattern, app, H)`: the upgrade through the scope's
+middleware and `H.open`, a handler, then `ready`, `message` and `close`
+on the loop. Left over:
+
+- WebTransport: the same for quic-zig's `onConnectRequest(session, id,
+  path, headers)`, `acceptSessionWithHeaders` or `rejectSession` after
+  `open`, and the session then the app's. Not done: no HTTP/3 client here
+  to test it end to end.
+- A refusal is only its status (`WsRequest.reject`): a `before`'s
+  `WWW-Authenticate` doesn't go with a 401. A quic-zig `rejectWith(status,
+  headers)` would carry it.
+- Sockets are found by `WsConn.id` in the app's `Sockets` map, since a
+  `Host` may be rebuilt per callback (netcode's is). A `user_data` slot on
+  quic-zig's `WsConn`, as `Exchange` has, would drop the map.
+- Per-socket state is `ws.data: ?*anyopaque`; a typed `H.State` the route
+  allocates could replace it.
+- A WebSocket test client in `http.testing`, so routes are tested
+  without a socket.
+- `Sec-WebSocket-Protocol`: `open` can't choose one yet.

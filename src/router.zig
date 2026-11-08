@@ -10,6 +10,7 @@ const context = @import("context.zig");
 const endpoint = @import("endpoint");
 const Middleware = @import("middleware.zig").Middleware;
 const Reaper = @import("reaper.zig").Reaper;
+const websocket = @import("websocket.zig");
 const Method = context.Method;
 const Request = context.Request;
 const Response = context.Response;
@@ -143,6 +144,15 @@ pub const Found = struct {
         return rest.run(c);
     }
 
+    /// Its `before` middleware, until one answers: whether one did.
+    pub fn before(self: *const Found, c: *Call) bool {
+        for (self.middleware()) |m| if (m.before) |hook| {
+            hook(m.ctx, c) catch |err| self.failWith(c, err);
+            if (c.response.answered) return true;
+        };
+        return false;
+    }
+
     /// The route's own answer for `err` (`Scope.errors`), or its status
     /// (`statusOf`), unless something answered already: that stands.
     pub fn failWith(self: *const Found, c: *Call, err: anyerror) void {
@@ -231,8 +241,11 @@ pub const Router = struct {
         errors: []const ErrorAnswer = &.{},
         /// Its body is read as it arrives (`endpoint.BodyStream`): the handler starts at the head.
         streams_body: bool = false,
+        /// A WebSocket route's hooks, its handler the upgrade's `open` (`Scope.ws`).
+        ws_hooks: ?*const websocket.Hooks = null,
     };
-    const Entry = struct { method: Method, path: []const u8, target: Target };
+    /// `method` null: a WebSocket route's.
+    const Entry = struct { method: ?Method, path: []const u8, target: Target };
 
     pub const Node = struct {
         segment: []const u8 = "",
@@ -241,6 +254,8 @@ pub const Router = struct {
         /// `*name`'s: what's left of the path, whatever it holds.
         rest: ?*Node = null,
         targets: std.EnumArray(Method, ?Target) = .initFill(null),
+        /// A WebSocket upgrade's route, beside its path's methods'.
+        ws: ?Target = null,
     };
 
     pub fn init(gpa: std.mem.Allocator) Router {
@@ -291,6 +306,10 @@ pub const Router = struct {
     pub fn delete(self: *Router, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
         return self.on(.DELETE, pattern, app, handler);
     }
+    /// `Scope.ws`, outside any scope.
+    pub fn ws(self: *Router, comptime pattern: []const u8, app: anytype, comptime H: type) !void {
+        return self.scope("").ws(pattern, app, H);
+    }
     /// `Scope.fallback` for every path: the transport's static files and 404 never come.
     pub fn fallback(self: *Router, app: anytype, comptime handler: anytype) !void {
         return self.scope("").fallback(app, handler);
@@ -305,15 +324,33 @@ pub const Router = struct {
         return self.scope("").addAll(other);
     }
 
-    /// `path` is the router's own.
-    fn insert(self: *Router, method: Method, path: []const u8, target: Target) !void {
-        const a = self.arena.allocator();
+    /// `path` is the router's own; `method` null for a WebSocket route.
+    fn insert(self: *Router, method: ?Method, path: []const u8, target: Target) !void {
+        const node = try self.nodeAt(path);
+        const slot = if (method) |m| node.targets.getPtr(m) else &node.ws;
+        if (slot.* != null) return error.DuplicateRoute;
+        slot.* = target;
+        try self.entries.append(self.arena.allocator(), .{ .method = method, .path = path, .target = target });
+    }
+
+    fn nodeAt(self: *Router, path: []const u8) !*Node {
         var node = &self.root;
         var it = std.mem.tokenizeScalar(u8, path, '/');
-        while (it.next()) |seg| node = try child(a, node, seg);
-        if (node.targets.get(method) != null) return error.DuplicateRoute;
-        node.targets.set(method, target);
-        try self.entries.append(a, .{ .method = method, .path = path, .target = target });
+        while (it.next()) |seg| node = try child(self.arena.allocator(), node, seg);
+        return node;
+    }
+
+    /// Where a WebSocket upgrade to `req`'s path leads; null when no route takes one.
+    pub fn findUpgrade(self: *const Router, req: *const Request) ?Found {
+        var found = self.lookup(true, req) orelse return null;
+        found.target = &found.node.ws.?;
+        return found;
+    }
+
+    fn lookup(self: *const Router, comptime upgrade: bool, req: *const Request) ?Found {
+        var found: Found = .{ .node = undefined, .target = null };
+        found.node = match(upgrade, &self.root, std.mem.tokenizeScalar(u8, req.path(), '/'), &found) orelse return null;
+        return found;
     }
 
     fn child(a: std.mem.Allocator, node: *Node, seg: []const u8) !*Node {
@@ -334,8 +371,7 @@ pub const Router = struct {
 
     /// Where `req`'s path and method lead; null when no route has the path.
     pub fn find(self: *const Router, req: *const Request) ?Found {
-        var found: Found = .{ .node = undefined, .target = null };
-        found.node = match(&self.root, std.mem.tokenizeScalar(u8, req.path(), '/'), &found) orelse return null;
+        var found = self.lookup(false, req) orelse return null;
         found.target = targetOf(found.node, req.method);
         return found;
     }
@@ -349,19 +385,22 @@ pub const Router = struct {
 
     /// Static segments before params, then a catch-all, trying the next
     /// way when one leads nowhere; `segs` is copied for that.
-    fn match(node: *const Node, segs: std.mem.TokenIterator(u8, .scalar), found: *Found) ?*const Node {
+    /// `upgrade`: a node with a WebSocket route, not a method's.
+    fn match(comptime upgrade: bool, node: *const Node, segs: std.mem.TokenIterator(u8, .scalar), found: *Found) ?*const Node {
         var rest = segs;
         const seg = rest.next() orelse {
-            for (node.targets.values) |t| if (t != null) return node;
+            if (upgrade) {
+                if (node.ws != null) return node;
+            } else for (node.targets.values) |t| if (t != null) return node;
             return catchAll(node, segs, found);
         };
         for (node.statics.items) |c| if (std.mem.eql(u8, c.segment, seg)) {
-            if (match(c, rest, found)) |f| return f;
+            if (match(upgrade, c, rest, found)) |f| return f;
         };
         if (node.param) |p| if (found.n < max_params) {
             found.captures[found.n] = seg;
             found.n += 1;
-            if (match(p, rest, found)) |f| return f;
+            if (match(upgrade, p, rest, found)) |f| return f;
             found.n -= 1;
         };
         return catchAll(node, segs, found);
@@ -504,6 +543,19 @@ pub const Scope = struct {
         if (streams and self.runs_on == null) return error.BodyStreamNotBlocking;
         const path = try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, pattern });
         return self.router.insert(method, path, self.targetFor(pattern, app, handler));
+    }
+
+    /// A WebSocket route: an upgrade to `pattern` goes through the scope's
+    /// middleware and `H.open`, a handler that accepts by returning; then
+    /// `H.ready(app, ws, call)` once it's accepted, `H.message(app, ws,
+    /// data, kind)` for each message and `H.close(app, ws, code, reason)`
+    /// (`http.WebSocket`). `ready` and `close` may be left out, and `app` is
+    /// `{}` when `open` takes none. On the loop: not in a blocking scope.
+    pub fn ws(self: Scope, comptime pattern: []const u8, app: anytype, comptime H: type) !void {
+        if (self.runs_on != null) return error.WebSocketBlocking;
+        var target = self.targetFor(pattern, app, H.open);
+        target.ws_hooks = websocket.Hooks.of(comptime route(pattern, H.open).App, H);
+        return self.router.insert(null, try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, pattern }), target);
     }
 
     /// What a path under the scope's prefix that no route has leads to, any

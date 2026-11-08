@@ -7,7 +7,10 @@
 //! HTTP/1.1 to the static files or a 404, on HTTP/3 to a 404.
 
 const std = @import("std");
-const Exchange = @import("quic").event_loop.Exchange;
+const event_loop = @import("quic").event_loop;
+const Exchange = event_loop.Exchange;
+const websocket = @import("websocket.zig");
+const WebSocket = websocket.WebSocket;
 const Mailbox = @import("quic").Mailbox;
 const reaper_mod = @import("reaper.zig");
 const Reaper = reaper_mod.Reaper;
@@ -26,6 +29,10 @@ pub const Host = struct {
     /// client its `X-Forwarded-For` names (`Request.client`). List every
     /// proxy on the way in, not just the nearest (`address.parseNetworks`).
     trusted_proxies: []const address.Network = &.{},
+    /// Where WebSocket routes' sockets are kept: the app's, one per loop,
+    /// since a `Host` may live no longer than a callback. Without one, an
+    /// upgrade is declined.
+    sockets: ?*websocket.Sockets = null,
 
     /// A request's own, from its head to its answer.
     const Pending = struct {
@@ -63,6 +70,67 @@ pub const Host = struct {
         return .{ .router = router, .gpa = gpa };
     }
 
+    /// An upgrade to a WebSocket route (`Scope.ws`): its scope's middleware
+    /// and `open` decide, then `ready` hears of the socket. False when no
+    /// route takes it, `req` left for the caller: an app's own sockets.
+    pub fn upgrade(self: *Host, req: *event_loop.WsRequest, path: []const u8) bool {
+        const sockets = self.sockets orelse return false;
+        const head: context.Request = .{ .method = .GET, .target = path, .headers = req.headers() };
+        const found = self.router.findUpgrade(&head) orelse return false;
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        var call: context.Call = .{ .request = head, .response = .init(arena.allocator()) };
+        call.request.client = address.clientOf(req.peerAddress(), head.headers, self.trusted_proxies);
+        if (!found.before(&call)) found.run(&call);
+        // Answered, or refused with an error: no socket.
+        if (call.response.answered) {
+            req.reject(call.response.status);
+            return true;
+        }
+        const conn = req.accept(.{ .headers = call.response.headers.items }) catch return true;
+        const target = found.target.?;
+        const ws = self.gpa.create(WebSocket) catch {
+            conn.close(1011, "");
+            return true;
+        };
+        ws.* = .{ .conn = conn, .app = target.app, .hooks = target.ws_hooks.? };
+        sockets.map.put(self.gpa, conn.id(), ws) catch {
+            self.gpa.destroy(ws);
+            conn.close(1011, "");
+            return true;
+        };
+        if (ws.hooks.ready) |ready| ready(ws, &call);
+        return true;
+    }
+
+    /// A message for a route's socket: false when `conn` isn't one.
+    pub fn message(self: *Host, conn: *event_loop.WsConn, data: []const u8, kind: WebSocket.Kind) bool {
+        const ws = (self.sockets orelse return false).map.get(conn.id()) orelse return false;
+        ws.hooks.message(ws, data, kind);
+        return true;
+    }
+
+    /// A route's socket closed: false when `conn` isn't one.
+    pub fn closed(self: *Host, conn: *event_loop.WsConn, code: u16, reason: []const u8) bool {
+        const ws = ((self.sockets orelse return false).map.fetchSwapRemove(conn.id()) orelse return false).value;
+        if (ws.hooks.close) |close| close(ws, code, reason);
+        self.gpa.destroy(ws);
+        return true;
+    }
+
+    /// `upgrade`, with no app's own sockets to leave a request to.
+    pub fn onWsUpgrade(self: *Host, req: *event_loop.WsRequest, path: []const u8) void {
+        if (!self.upgrade(req, path)) req.reject(404);
+    }
+
+    pub fn onWsMessage(self: *Host, conn: *event_loop.WsConn, data: []const u8, kind: WebSocket.Kind) void {
+        _ = self.message(conn, data, kind);
+    }
+
+    pub fn onWsClose(self: *Host, conn: *event_loop.WsConn, code: u16, reason: []const u8) void {
+        _ = self.closed(conn, code, reason);
+    }
+
     pub fn onHttpHead(self: *Host, ex: *Exchange) void {
         const method = std.meta.stringToEnum(context.Method, ex.method) orelse return ex.pass();
         // Routed on the head's own slices: a request no route has costs nothing.
@@ -76,10 +144,7 @@ pub const Host = struct {
         p.call.request.client = address.clientOf(ex.peerAddress(), head.headers, self.trusted_proxies);
         p.found.rebase(head.target, p.call.request.target);
         ex.user_data = p;
-        for (found.middleware()) |m| if (m.before) |before| {
-            before(m.ctx, &p.call) catch |err| p.found.failWith(&p.call, err);
-            if (p.call.response.answered) return answer(p);
-        };
+        if (p.found.before(&p.call)) return answer(p);
         const target = found.target orelse {
             found.run(&p.call);
             return answer(p);

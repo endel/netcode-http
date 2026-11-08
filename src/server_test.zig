@@ -31,10 +31,8 @@ fn fetch(port: u16, request: []const u8, buf: []u8) ![]const u8 {
 
 /// `fetch`, waiting `ms` before reading: a client that falls behind.
 fn fetchAfter(port: u16, request: []const u8, buf: []u8, ms: u64) ![]const u8 {
-    const fd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    const fd = try dial(port);
     defer sys.close(fd);
-    const addr = try quic.sockaddr.Address.parseIp4("127.0.0.1", port);
-    if (std.c.connect(fd, &addr.any, addr.getOsSockLen()) != 0) return error.ConnectionRefused;
     const out: sys.File = .{ .fd = fd };
     try out.writeAll(request);
     sys.sleepNs(ms * std.time.ns_per_ms);
@@ -45,6 +43,15 @@ fn fetchAfter(port: u16, request: []const u8, buf: []u8, ms: u64) ![]const u8 {
         len += @intCast(n);
     }
     return buf[0..len];
+}
+
+/// A TCP connection to the server on `port`.
+fn dial(port: u16) !std.posix.fd_t {
+    const fd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    errdefer sys.close(fd);
+    const addr = try quic.sockaddr.Address.parseIp4("127.0.0.1", port);
+    if (std.c.connect(fd, &addr.any, addr.getOsSockLen()) != 0) return error.ConnectionRefused;
+    return fd;
 }
 
 fn bodyOf(response: []const u8) []const u8 {
@@ -594,5 +601,100 @@ fn sumSmall(ctx: *http.Context(.{ .body = http.endpoint.BodyStream, .max_body = 
         const n = try ctx.body.read(&buf);
         if (n == 0) return total;
         total += n;
+    }
+}
+
+const Lobby = struct {
+    closed: std.atomic.Value(u32) = .init(0),
+};
+
+const Chat = struct {
+    pub fn open(_: *Lobby, ctx: *http.Context(.{ .params = struct { id: u32 } })) !void {
+        try ctx.call.setLocal(u32, ctx.params.id);
+    }
+
+    pub fn ready(_: *Lobby, ws: *http.WebSocket, call: *http.Call) void {
+        var buf: [64]u8 = undefined;
+        const greeting = std.fmt.bufPrint(&buf, "welcome {s} to {d}", .{ call.local(Visitor).?.name, call.local(u32).?.* }) catch return;
+        ws.sendText(greeting) catch {};
+    }
+
+    pub fn message(_: *Lobby, ws: *http.WebSocket, data: []const u8, _: http.WebSocket.Kind) void {
+        ws.sendText(data) catch {};
+    }
+
+    pub fn close(lobby: *Lobby, _: *http.WebSocket, _: u16, _: []const u8) void {
+        _ = lobby.closed.fetchAdd(1, .release);
+    }
+};
+
+const ws_upgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+
+/// A raw WebSocket client, upgraded to `path` as ann.
+fn wsOpen(port: u16, path: []const u8) !std.posix.fd_t {
+    const fd = try dial(port);
+    errdefer sys.close(fd);
+    var req: [512]u8 = undefined;
+    try (sys.File{ .fd = fd }).writeAll(try std.fmt.bufPrint(&req, "GET {s} HTTP/1.1\r\nHost: x\r\n" ++ ws_upgrade ++ "X-Visitor: ann\r\n\r\n", .{path}));
+    // A byte at a time: the first frame may follow the head in the same read.
+    var head: [512]u8 = undefined;
+    var len: usize = 0;
+    while (!std.mem.endsWith(u8, head[0..len], "\r\n\r\n")) : (len += 1) try readExact(fd, head[len..][0..1]);
+    if (!std.mem.startsWith(u8, head[0..len], "HTTP/1.1 101 ")) return error.NotUpgraded;
+    return fd;
+}
+
+/// One frame's payload, unmasked as a server sends it, short.
+fn wsRead(fd: std.posix.fd_t, buf: []u8) ![]const u8 {
+    var hdr: [2]u8 = undefined;
+    try readExact(fd, &hdr);
+    const n = hdr[1] & 0x7f;
+    try readExact(fd, buf[0..n]);
+    return buf[0..n];
+}
+
+/// A masked frame, as a client sends one: `opcode` 1 text, 8 close.
+fn wsWrite(fd: std.posix.fd_t, opcode: u8, payload: []const u8) !void {
+    var frame: [134]u8 = undefined;
+    const mask = [4]u8{ 1, 2, 3, 4 };
+    frame[0] = 0x80 | opcode;
+    frame[1] = 0x80 | @as(u8, @intCast(payload.len));
+    @memcpy(frame[2..6], &mask);
+    for (payload, 0..) |b, i| frame[6 + i] = b ^ mask[i % 4];
+    try (sys.File{ .fd = fd }).writeAll(frame[0 .. 6 + payload.len]);
+}
+
+fn readExact(fd: std.posix.fd_t, buf: []u8) !void {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.read(fd, buf[got..].ptr, buf.len - got);
+        if (n <= 0) return error.Closed;
+        got += @intCast(n);
+    }
+}
+
+test "on a server: a WebSocket route's upgrade goes through its middleware and open, then its hooks hear the socket" {
+    var lobby: Lobby = .{};
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("").with(&.{.{ .before = nameVisitor }})).ws("/rooms/:id", &lobby, Chat);
+    const server = try http.Server.create(gpa, &router, .{});
+    defer server.destroy();
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, try fetch(server.port(), "GET /rooms/7 HTTP/1.1\r\nHost: x\r\n" ++ ws_upgrade ++ "\r\n", &buf), "HTTP/1.1 401 "));
+    try std.testing.expect(std.mem.startsWith(u8, try fetch(server.port(), "GET /rooms/seven HTTP/1.1\r\nHost: x\r\n" ++ ws_upgrade ++ "X-Visitor: ann\r\n\r\n", &buf), "HTTP/1.1 404 "));
+
+    const fd = try wsOpen(server.port(), "/rooms/7");
+    try expectEqualStrings("welcome ann to 7", try wsRead(fd, &buf));
+    try wsWrite(fd, 1, "hi");
+    try expectEqualStrings("hi", try wsRead(fd, &buf));
+    try wsWrite(fd, 8, &.{ 0x03, 0xe8 }); // close, 1000
+    _ = try wsRead(fd, &buf); // its answer
+    sys.close(fd);
+    var waited: u32 = 0;
+    while (lobby.closed.load(.acquire) == 0) : (waited += 1) {
+        if (waited > 2000) return error.NotClosed;
+        sys.sleepNs(std.time.ns_per_ms);
     }
 }

@@ -19,6 +19,8 @@ const address = @import("address.zig");
 pub const Server = struct {
     gpa: std.mem.Allocator,
     host: Host,
+    /// Its WebSocket routes' sockets.
+    sockets: @import("websocket.zig").Sockets = .{},
     loop: xev.Loop,
     http: http1.Server,
     stop_wake: xev.Async,
@@ -50,6 +52,7 @@ pub const Server = struct {
             .stop_wake = undefined,
             .thread = undefined,
         };
+        self.host.sockets = &self.sockets;
         errdefer self.loop.deinit();
         self.http = try http1.Server.init(gpa, .{
             .tls = false,
@@ -71,6 +74,7 @@ pub const Server = struct {
         self.stop_wake.notify() catch {};
         self.thread.join();
         self.http.deinit();
+        self.sockets.deinit(self.gpa);
         self.stop_wake.deinit();
         self.loop.deinit();
         self.gpa.free(self.host.trusted_proxies);
