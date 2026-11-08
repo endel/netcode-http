@@ -9,15 +9,15 @@
 const std = @import("std");
 const event_loop = @import("quic").event_loop;
 const Exchange = event_loop.Exchange;
-const websocket = @import("websocket.zig");
+const websocket = @import("../websocket.zig");
 const WebSocket = websocket.WebSocket;
 const Mailbox = @import("quic").Mailbox;
 const reaper_mod = @import("reaper.zig");
 const Reaper = reaper_mod.Reaper;
-const context = @import("context.zig");
-const router_mod = @import("router.zig");
+const context = @import("../context.zig");
+const router_mod = @import("../router.zig");
 const Router = router_mod.Router;
-const address = @import("address.zig");
+const address = @import("../address.zig");
 
 /// A body of known length is reserved up to this much at its head.
 const eager_body = 1 << 20;

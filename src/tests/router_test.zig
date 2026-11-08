@@ -1,5 +1,5 @@
 const std = @import("std");
-const http = @import("http.zig");
+const http = @import("../http.zig");
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 

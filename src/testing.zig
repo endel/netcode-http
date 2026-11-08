@@ -15,8 +15,8 @@ const Loop = quic.event_loop.Xev.Loop;
 const Mailbox = quic.Mailbox;
 const context = @import("context.zig");
 const Router = @import("router.zig").Router;
-const Host = @import("quic.zig").Host;
-const Pendings = @import("quic.zig").Pendings;
+const Host = @import("serve/host.zig").Host;
+const Pendings = @import("serve/host.zig").Pendings;
 const getHeader = quic.http1.parser.getHeader;
 const Address = @import("address.zig").Address;
 

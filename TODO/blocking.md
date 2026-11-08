@@ -56,7 +56,7 @@ Evented, later: the app passes a different `io` and handlers don't change.
    off the loop too.
 2. **In:** a handler whose client left is canceled, and a scope's
    `deadline` cancels one and answers 504. Each request is a `Future`
-   collected by a reaper thread per router and `Io` (`src/reaper.zig`),
+   collected by a reaper thread per router and `Io` (`src/serve/reaper.zig`),
    since `Future.cancel` waits for the task. Who acts first (the handler
    returning, the deadline, the client leaving) is one atomic state. Each
    request owes the loop two posts: its task's `done` and the reaper's

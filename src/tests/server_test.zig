@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const quic = @import("quic");
-const http = @import("http.zig");
+const http = @import("../http.zig");
 const sys = quic.sys;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;

@@ -58,17 +58,17 @@ pub const RateLimit = middleware.RateLimit;
 pub const access_log = middleware.access_log;
 
 /// Serving a router from quic-zig's listeners.
-pub const quic = @import("quic.zig");
+pub const quic = @import("serve/host.zig");
 /// A router on a listener of its own.
-pub const Server = @import("server.zig").Server;
+pub const Server = @import("serve/server.zig").Server;
 pub const testing = @import("testing.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = context;
     _ = address;
-    _ = @import("router_test.zig");
-    _ = @import("e2e_test.zig");
-    _ = @import("server_test.zig");
+    _ = @import("tests/router_test.zig");
+    _ = @import("tests/e2e_test.zig");
+    _ = @import("tests/server_test.zig");
     _ = middleware;
 }

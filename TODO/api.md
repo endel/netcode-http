@@ -19,7 +19,7 @@ and `detail`. Left over:
 
 **In:** a refused query or body says which field and why, in the problem's
 detail; a struct's `rules` (`min`, `max`, `min_len`, `max_len`) and `check`
-hold decoded values past their types (`src/rules.zig`). Left over:
+hold decoded values past their types (`src/endpoint/rules.zig`). Left over:
 
 - A missing JSON field is reported by position, not name: std.json's
   `MissingField` doesn't say which.

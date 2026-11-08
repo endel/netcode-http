@@ -14,11 +14,11 @@ const quic = @import("quic");
 const http1 = quic.http1;
 const event_loop = quic.event_loop;
 const xev = event_loop.Xev;
-const Router = @import("router.zig").Router;
-const Host = @import("quic.zig").Host;
-const Pendings = @import("quic.zig").Pendings;
-const address = @import("address.zig");
-const Sockets = @import("websocket.zig").Sockets;
+const Router = @import("../router.zig").Router;
+const Host = @import("host.zig").Host;
+const Pendings = @import("host.zig").Pendings;
+const address = @import("../address.zig");
+const Sockets = @import("../websocket.zig").Sockets;
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
