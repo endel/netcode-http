@@ -168,8 +168,17 @@ fn user(app: *App, ctx: *http.Context(.{ .params = struct { id: u64 } })) !User 
   reads one half-closing it, which still gets its answer. The handler there
   runs to its end; only the deadline cuts it short.
 - A handler off the loop shares nothing with it: what the loop owns, a
-  game's state say, it must not touch. `before` middleware still runs on
-  the loop.
+  game's state say, it reaches through `ctx.onLoop(func, args)`, which runs
+  `func` on the loop and waits for what it returns. `before` middleware
+  still runs on the loop.
+
+```zig
+fn submit(game: *Game, ctx: *http.Context(.{ .body = Score })) !void {
+    try game.db.save(ctx.io, ctx.body); // blocks: off the loop
+    _ = try ctx.onLoop(Game.rank, .{ game, ctx.body }); // the game's, on the loop
+}
+```
+
 - On the loop, `ctx.io` is `std.Io.failing`: I/O fails there rather than
   stall the loop.
 - The first blocking scope on an `Io` starts a thread that collects and

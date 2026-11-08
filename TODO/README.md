@@ -15,11 +15,11 @@ depends on the API.
 
 ### 1. Finish blocking scopes (`blocking.md`)
 
-1. Cancellation and deadlines. A handler whose client left still holds its
+1. **In.** Cancellation and deadlines. A handler whose client left still holds its
    task, so under a slow database the abandoned ones use up the `Io`'s
    room and everything else is 503. The per-request cancel handle is
    reused for streaming.
-2. `ctx.onLoop(func, args)`. Small, and what makes blocking scopes usable
+2. **In.** `ctx.onLoop(func, args)`. Small, and what makes blocking scopes usable
    for netcode: game state read without locks.
 3. Middleware rework (`api.md`): typed locals handed to the handler,
    middleware around the handler, and `before` on the `io` in blocking

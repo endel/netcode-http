@@ -62,6 +62,8 @@ pub const Response = struct {
         send: *const fn (ctx: *anyopaque) void,
         /// Where offloaded work comes back to.
         mailbox: *Mailbox,
+        /// From a blocking handler's task: `post` run on the loop's thread.
+        to_loop: *const fn (ctx: *anyopaque, post: *Mailbox.Post) void,
     };
 
     pub fn init(arena: std.mem.Allocator) Response {
@@ -160,6 +162,23 @@ pub fn Context(comptime spec: Spec) type {
             self.response.sendOwned(status, content_type, body);
         }
 
+        /// `func(args)` on the event loop's thread, and what it returns: a
+        /// blocking handler's way to the loop's state, a game's say, without
+        /// locks. Waits for it; canceled meanwhile, the handler still waits
+        /// for `func` to run, then gets `error.Canceled`. On the loop it's a call.
+        pub fn onLoop(self: *Self, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) OnLoop(func).Result {
+            const res = self.response;
+            if (!res.off_loop) return @call(.auto, func, args);
+            var job: OnLoop(func) = .{ .args = args, .io = self.io };
+            const late = res.late.?;
+            late.to_loop(late.ctx, &job.post);
+            job.done.wait(self.io) catch |err| {
+                job.done.waitUncancelable(self.io); // `job` is on this stack
+                return err;
+            };
+            return job.result;
+        }
+
         /// `func(args)` on one of `on`'s threads, whose result answers back
         /// on the loop: a `Reply` as it is, anything else as JSON (204 for
         /// `void`), an error with its status. The request (its arena, body
@@ -192,6 +211,30 @@ pub const Reply = struct {
     /// valid field fails the answer with 500.
     headers: []const Header = &.{},
 };
+
+fn OnLoop(comptime func: anytype) type {
+    const R = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+    return struct {
+        post: Mailbox.Post = .{ .run = run },
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+        io: std.Io,
+        result: R = undefined,
+        done: std.Io.Event = .unset,
+
+        /// What `Context.onLoop` returns: `func`'s result, and its errors and the wait's.
+        pub const Result = switch (@typeInfo(R)) {
+            .error_union => |eu| (eu.error_set || std.Io.Cancelable)!eu.payload,
+            else => std.Io.Cancelable!R,
+        };
+
+        /// On the loop's thread.
+        fn run(p: *Mailbox.Post) void {
+            const self: *@This() = @alignCast(@fieldParentPtr("post", p));
+            self.result = @call(.auto, func, self.args);
+            self.done.set(self.io);
+        }
+    };
+}
 
 fn Offload(comptime func: anytype) type {
     const R = @typeInfo(@TypeOf(func)).@"fn".return_type.?;

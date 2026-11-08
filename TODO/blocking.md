@@ -79,8 +79,11 @@ Evented, later: the app passes a different `io` and handlers don't change.
      rehoming routes. An app-owned `http.Blocking.init(io)` passed to
      `blocking(&b, ...)` would drop all three. Worth it by phase 6.
 3. `before` middleware on the `io` for blocking scopes, so auth can query.
-4. `ctx.onLoop(func, args)`: run `func` on the loop and wait for it. Lets a
-   blocking handler read game state without locks.
+4. **In:** `ctx.onLoop(func, args)` runs `func` on the loop and waits for
+   it, so a blocking handler reaches game state without locks. It calls
+   the Mailbox's `expect` off the loop (`Host.toLoop` says why it's safe).
+   A quic-zig `Mailbox.expectWhileOwed`, an atomic add asserting something
+   is owed, would make that the Mailbox's promise.
 5. Retire `Pool` and `ctx.offload` once blocking scopes cover their uses.
 6. Spike zio as the `io`. The question is whether quic-zig's loop thread
    may spawn into it, or needs the queue and wakeup above.

@@ -314,3 +314,61 @@ test "a blocking handler whose client left is canceled" {
     try expectEqual(null, (try c.request(.GET, "/slow", .{ .leave = true })).status);
     try std.testing.expect(db.canceled.load(.acquire));
 }
+
+const Game = struct {
+    score: u32 = 0,
+    ran_on: std.Thread.Id = 0,
+
+    /// The loop's own: only ever called there.
+    fn bump(game: *Game, by: u32) !u32 {
+        if (by == 0) return error.BadRequest;
+        game.ran_on = std.Thread.getCurrentId();
+        game.score += by;
+        return game.score;
+    }
+
+    fn add(game: *Game, ctx: *http.Context(.{ .params = struct { by: u32 } })) !u32 {
+        return ctx.onLoop(bump, .{ game, ctx.params.by });
+    }
+};
+
+test "onLoop takes a blocking handler to the loop's state, and is a call on the loop" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var game: Game = .{};
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("/off").blocking(threaded.io(), .{})).get("/add/:by", &game, Game.add);
+    try router.get("/on/add/:by", &game, Game.add);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    try expectEqualStrings("5", (try c.get("/off/add/5")).body);
+    try expectEqual(std.Thread.getCurrentId(), game.ran_on); // the client's loop
+    try expectEqualStrings("7", (try c.get("/on/add/2")).body);
+    try expectEqual(400, (try c.get("/off/add/0")).status.?);
+    try expectEqual(7, game.score);
+}
+
+fn addOne(port: u16) void {
+    var buf: [512]u8 = undefined;
+    for (0..4) |_| _ = fetch(port, "GET /add/1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &buf) catch {};
+}
+
+test "on a server: blocking handlers in parallel update the loop's state one at a time" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var game: Game = .{};
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("").blocking(threaded.io(), .{})).get("/add/:by", &game, Game.add);
+    const server = try http.Server.create(gpa, &router, .{});
+    defer server.destroy();
+
+    var clients: [16]std.Thread = undefined;
+    for (&clients) |*t| t.* = try std.Thread.spawn(.{}, addOne, .{server.port()});
+    for (clients) |t| t.join();
+    try expectEqual(64, game.score);
+}

@@ -64,7 +64,7 @@ pub const Host = struct {
         p.* = .{ .arena = .init(self.gpa), .ex = ex, .req = head, .res = undefined, .found = found, .content_length = ex.content_length };
         const a = p.arena.allocator();
         p.res = .init(a);
-        if (ex.mailbox) |m| p.res.late = .{ .ctx = p, .send = sendLater, .mailbox = m };
+        if (ex.mailbox) |m| p.res.late = .{ .ctx = p, .send = sendLater, .mailbox = m, .to_loop = toLoop };
         p.req = copyHead(a, &head) catch return fail(p, 500);
         p.req.client = address.clientOf(ex.peerAddress(), head.headers, self.trusted_proxies);
         p.found.rebase(head.target, p.req.target);
@@ -163,6 +163,15 @@ pub const Host = struct {
             },
             .abandoned => {},
         }
+    }
+
+    /// From the task: `expect` is the loop's, but while the handler runs its
+    /// `done` is owed, so the watch is on and `expect` only counts.
+    fn toLoop(ctx: *anyopaque, post: *Mailbox.Post) void {
+        const p: *Pending = @ptrCast(@alignCast(ctx));
+        const mailbox = p.res.late.?.mailbox;
+        mailbox.expect();
+        mailbox.post(post);
     }
 
     fn reapedOffLoop(post: *Mailbox.Post) void {
