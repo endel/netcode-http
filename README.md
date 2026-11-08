@@ -3,7 +3,9 @@
 HTTP routes for servers built on [quic-zig](https://github.com/endel/quic-zig):
 a router you embed in a server that already runs an event loop, a game
 server say, so its HTTP shares the port, the certificates and the loop.
-[netcode](https://github.com/endel/netcode) serves its HTTP with it.
+[netcode](https://github.com/endel/netcode) serves its HTTP with it. Or it
+serves on its own: [`http.Server`](#a-listener-of-its-own), plain HTTP/1.1,
+or TLS with HTTP/3.
 
 ```zig
 const http = @import("http");
@@ -29,7 +31,8 @@ try router.post("/scores", &game, Game.submit);
 
 ## Using it
 
-Zig 0.17:
+Zig 0.17.1. Each release says which Zig it needs (`minimum_zig_version`);
+no API promise across Zig releases before 1.0.
 
 ```sh
 zig fetch --save=http git+https://github.com/endel/netcode-http
@@ -43,10 +46,22 @@ exe.root_module.addImport("http", http.module("http"));
 shared.addImport("endpoint", http.module("endpoint"));
 ```
 
-A project that also depends on quic-zig must pin the same commit this
-package does, or the build fails with "file exists in modules". To build
-against local checkouts instead of the pins:
+An app that uses quic-zig too takes it from here. One pinned on its own is
+a second copy whose types won't match `http.quic.Host`'s (or, at the same
+commit, "file exists in modules"):
+
+```zig
+exe.root_module.addImport("quic", http.module("quic"));
+// Or one of its own, in place of the pin, if it's API-compatible:
+http.module("http").addImport("quic", my_quic);
+```
+
+To build against local checkouts instead of the pins:
 `zig build --fork=../quic-zig --fork=../http`.
+
+[`examples/notes.zig`](examples/notes.zig) is a whole app: a CRUD API on a
+store that blocks like a database, its contracts, OpenAPI, and a listener
+of its own (`zig build notes`).
 
 ## Handlers
 
@@ -136,7 +151,8 @@ pub const Api = struct {
         .params = struct { game: []const u8 },
         .query = struct { limit: u8 = 10 },
         .result = []const Score,
-        // What it answers with beside the result, as problems.
+        // What it answers with beside the result, as problems: a
+        // handler's `error.NotFound` answers 404 with this `why`.
         .errors = &.{.{ .status = 404, .why = "no such game" }},
     });
 };

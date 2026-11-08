@@ -27,3 +27,5 @@ the commits that changed these. Then:
 - **Custom middleware** takes `*http.Call` (`before`, `after`) and
   `http.Next` (`around`). netcode only uses the built-ins, whose
   `.middleware()` is unchanged.
+- **quic-zig, once:** it can take quic-zig from `http.module("quic")` and
+  drop its own pin, so a bump of this package is the only one.
