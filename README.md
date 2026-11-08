@@ -338,12 +338,21 @@ pub fn onWsClose(self: *App, ws: *quic.event_loop.WsConn, code: u16, reason: []c
 
 ## A listener of its own
 
-`http.Server` serves a router on an HTTP/1.1 listener of its own, with a
-thread and loop of its own: a control or admin port beside a game's.
+`http.Server` serves a router on a thread and loop of its own. Plain, it's
+HTTP/1.1: a control or admin port beside a game's. With `tls`, it's
+quic-zig's server: HTTP/1.1 over TLS and HTTP/3 on one port, WebSockets
+included.
 
 ```zig
 const admin = try http.Server.create(gpa, &router, .{ .address = "127.0.0.1", .port = 4480 });
 defer admin.destroy();
+
+const api = try http.Server.create(gpa, &router, .{ .address = "0.0.0.0", .port = 443, .tls = .{
+    .cert_path = "certs/server.crt",
+    .key_path = "certs/server.key",
+} });
+defer api.destroy();
+api.drain(10_000); // on the way out: no new connections, and stop once those open are done
 ```
 
 ## On quic-zig

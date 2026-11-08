@@ -87,6 +87,11 @@ test "a listener of its own: a bearer token guards it, and a blocking handler pi
     try expectEqualStrings("6", bodyOf(summed));
     const empty = try fetch(server.port(), "POST /sum HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", &buf);
     try std.testing.expect(std.mem.startsWith(u8, empty, "HTTP/1.1 400 "));
+
+    // Quiet, it drains at once, well inside its grace.
+    const t0 = sys.nanoTimestamp();
+    server.drain(5000);
+    try std.testing.expect(sys.nanoTimestamp() - t0 < std.time.ns_per_s);
 }
 
 fn hello(ctx: *http.Context(.{})) !void {
@@ -697,4 +702,36 @@ test "on a server: a WebSocket route's upgrade goes through its middleware and o
         if (waited > 2000) return error.NotClosed;
         sys.sleepNs(std.time.ns_per_ms);
     }
+}
+
+/// A client's own loop, stepped while the server runs on its thread.
+const ClientLoop = struct {
+    loop: quic.event_loop.Xev.Loop,
+
+    pub fn step(self: *ClientLoop) !void {
+        try self.loop.run(.no_wait);
+        sys.sleepNs(50 * std.time.ns_per_us);
+    }
+};
+
+test "with tls: HTTP/3 on its own thread and loop, and a drain that stops it once it's quiet" {
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try router.get("/hello", {}, hello);
+    const server = try http.Server.create(gpa, &router, .{ .tls = .{
+        .cert_path = "../quic-zig/interop/browser/certs/server.crt",
+        .key_path = "../quic-zig/interop/browser/certs/server.key",
+    } });
+    defer server.destroy();
+
+    var client: ClientLoop = .{ .loop = try .init(.{}) };
+    defer client.loop.deinit();
+    var a: http.testing.Http3 = .{ .path = "/hello" };
+    try a.fetch(gpa, &client.loop, server.port(), &client);
+    try expectEqualStrings("200", &a.status);
+    try expectEqualStrings("hello", a.text());
+
+    const t0: i64 = sys.nanoTimestamp();
+    server.drain(5000);
+    try std.testing.expect(sys.nanoTimestamp() - t0 < 5 * std.time.ns_per_s);
 }

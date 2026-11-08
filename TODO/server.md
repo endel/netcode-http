@@ -2,15 +2,23 @@
 
 ## A standalone server for real use
 
-`http.Server` is meant for an admin port (`src/server.zig`): HTTP/1.1, no
-TLS (`.tls = false`), one thread and loop, 64 connections by default. An app
-that is only an API wants one call that serves TLS, HTTP/1.1 and HTTP/3 on
-every core. Or failing that, a documented recipe on quic-zig's
-`event_loop.Server`.
+**In:** `http.Server` with `tls`: quic-zig's server on a thread of its
+own, HTTP/1.1 over TLS and HTTP/3 on one port, WebSockets included; and
+for either mode `drain(grace_ms)`, which stops once the open connections
+are done. Left over:
 
-- Every core: one loop per core under `reuse_port`, which quic-zig already
-  supports, with the router shared (it's read-only once built).
-- Certificates from files, and reloading them.
+- Every core. Several servers under `reuse_port` need QUIC's connection
+  IDs routed to the server that owns each, and a shared `retry_token_key`
+  and reset key. quic-zig has `quic_lb`, `foreign_datagram` and
+  `injectDatagram`, and a test where a migrated peer landing on the wrong
+  worker is steered to its owner; its `SteerRouter`/`SteerWorker` exist
+  only in that test. Exported as a worker pool, `http.Server` takes a
+  `workers` count.
+- Certificates reloaded without a restart.
+- `drain` carries itself to the loop with an `xev.Async` of the server's
+  own and checks with a timer: quic-zig's `requestDrain` runs no pass,
+  so `onPass` never sees it. A `DrainOptions.grace` in quic-zig, stopping
+  by itself, would drop both, and netcode would use it too.
 
 ## Timeouts
 

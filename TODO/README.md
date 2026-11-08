@@ -52,7 +52,8 @@ Independent of 1.
 
 ### 4. Standing alone (`server.md`, `packaging.md`)
 
-12. A standalone server: TLS, HTTP/3 and every core in one call, graceful
+12. **Half in:** TLS, HTTP/3 and a graceful drain in one call; every core and
+    slow-body timeouts left (`server.md`). A standalone server: TLS, HTTP/3 and every core in one call, graceful
     drain, timeouts for slow bodies and headers.
 13. Packaging: the quic-zig pin, docs and a CRUD-on-a-database example,
     the Zig version policy. Then a first public release, maybe the rename.
