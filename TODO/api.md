@@ -45,14 +45,16 @@ Left over:
 
 ## Cookies
 
-No parsing of `Cookie`, and nothing to build `Set-Cookie` with its
-attributes (HttpOnly, Secure, SameSite, Max-Age, Path, Domain). Signed and
-encrypted cookies belong with sessions (`web-app.md`).
+**In:** `Request.cookie`, `Response.setCookie` and `clearCookie`, secure by
+default. Signed and encrypted cookies belong with sessions (`web-app.md`).
 
 ## Forms
 
-- `application/x-www-form-urlencoded` into a struct: nearly free, since the
-  query decoder already reads `+` as a space (`percentDecode`).
+**In:** a spec's `.form = true` takes an `application/x-www-form-urlencoded`
+body too, read as a query is, rules and details alike (`form.age: at least
+13`). A JSON body sent as another `Content-Type` is 415, so a cross-site
+form can't post one without a preflight. Left over:
+
 - `multipart/form-data` with file parts, streamed to disk rather than
   gathered (`streaming.md`).
 
@@ -63,11 +65,15 @@ Bodies decode as JSON or raw bytes, and answers are JSON. Nothing reads
 
 ## Router
 
-- `put`, `patch` and `delete` shortcuts on `Router` and `Scope`, beside
-  `get` and `post`. `PATCH` in `endpoint` if it's missing.
-- An app's own 404 and 405. What no route has goes back to quic-zig: static
-  files or its 404.
+**In:** `put`, `patch` and `delete` shortcuts (and `endpoint.patch`); a
+scope's `fallback` for paths under its prefix no route has; a 405 that
+goes through the error path, so `Scope.errors` words it. Left over:
+
 - A trailing-slash policy (redirect or match).
+- Outside any fallback, a path no route has still gets quic-zig's text 404
+  or 405.
+- Static files first and a fallback after (an SPA's `index.html`) needs
+  the transport to try them in that order.
 
 ## Contracts
 

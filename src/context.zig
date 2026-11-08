@@ -36,6 +36,21 @@ pub const Request = struct {
     pub fn header(self: *const Request, name: []const u8) ?[]const u8 {
         return parser.getHeader(self.headers, name);
     }
+
+    /// The first cookie named `name`, as sent, its quotes off.
+    pub fn cookie(self: *const Request, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "cookie")) {
+            var it = std.mem.splitScalar(u8, h.value, ';');
+            while (it.next()) |pair| {
+                const kv = std.mem.trim(u8, pair, " \t");
+                const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+                if (!std.mem.eql(u8, kv[0..eq], name)) continue;
+                const v = kv[eq + 1 ..];
+                return if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
+            }
+        };
+        return null;
+    }
 };
 
 pub const statusOf = endpoint.statusOf;
@@ -52,6 +67,48 @@ pub const Response = struct {
     pub fn init(arena: std.mem.Allocator) Response {
         return .{ .arena = arena };
     }
+
+    /// Sets cookie `name` to `value`, `error.InvalidCookie` for a name that
+    /// isn't a token or a value a cookie can't hold (space, `"`, `,`, `;`,
+    /// `\\`), and for `SameSite=None` without `Secure`, which browsers drop.
+    pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: Cookie) !void {
+        if (!parser.isToken(name) or !cookieSafe(value, false) or !cookieSafe(opts.path, true) or !cookieSafe(opts.domain orelse "", true)) return error.InvalidCookie;
+        if (opts.same_site == .none and !opts.secure) return error.InvalidCookie;
+        const a = self.arena;
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(a, "{s}={s}; Path={s}", .{ name, value, opts.path });
+        if (opts.domain) |d| try out.print(a, "; Domain={s}", .{d});
+        if (opts.max_age) |s| try out.print(a, "; Max-Age={d}", .{s});
+        try out.print(a, "{s}{s}; SameSite={s}", .{
+            if (opts.secure) "; Secure" else "",
+            if (opts.http_only) "; HttpOnly" else "",
+            switch (opts.same_site) {
+                .strict => "Strict",
+                .lax => "Lax",
+                .none => "None",
+            },
+        });
+        try self.headers.append(a, .{ .name = "Set-Cookie", .value = out.items });
+    }
+
+    /// Tells the browser to drop cookie `name`: `opts`' path and domain as it was set with.
+    pub fn clearCookie(self: *Response, name: []const u8, opts: Cookie) !void {
+        var gone = opts;
+        gone.max_age = 0;
+        return self.setCookie(name, "", gone);
+    }
+
+    pub const Cookie = struct {
+        /// Seconds it lives; null: until the browser closes.
+        max_age: ?i64 = null,
+        path: []const u8 = "/",
+        domain: ?[]const u8 = null,
+        /// Sent over HTTPS only; browsers let localhost off.
+        secure: bool = true,
+        /// Kept from scripts.
+        http_only: bool = true,
+        same_site: enum { strict, lax, none } = .lax,
+    };
 
     /// Unanswered again, its headers dropped: for an answer that replaces
     /// whatever was built so far.
@@ -121,6 +178,16 @@ pub const Response = struct {
         self.answered = true;
     }
 };
+
+/// RFC 6265's cookie-octets; an attribute's value may hold spaces and quotes too.
+fn cookieSafe(text: []const u8, attribute: bool) bool {
+    for (text) |c| switch (c) {
+        0...0x1f, 0x7f, ';' => return false,
+        ' ', '"', ',', '\\' => if (!attribute) return false,
+        else => {},
+    };
+    return true;
+}
 
 /// A request and its answer on their way through middleware to the handler:
 /// what all of them share.
@@ -205,6 +272,10 @@ pub fn Context(comptime spec: Spec) type {
 
         pub fn setHeader(self: *Self, name: []const u8, value: []const u8) !void {
             return self.response.setHeader(name, value);
+        }
+
+        pub fn setCookie(self: *Self, name: []const u8, value: []const u8, opts: Response.Cookie) !void {
+            return self.response.setCookie(name, value, opts);
         }
 
         pub fn send(self: *Self, status: u16, content_type: []const u8, body: []const u8) !void {

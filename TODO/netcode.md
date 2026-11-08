@@ -12,6 +12,9 @@ the commits that changed these. Then:
 - **`endpoint.decodeQuery` and `decodeBody` take a `why`**
   (`src/wasm/guest.zig`). `null` keeps today's behaviour; `&why` gives the
   reason for the guest's 400, which its `fail()` could send on.
+- **A JSON body sent as a `Content-Type` other than JSON is 415.** netcode's
+  clients send `application/json` (`endpoint.contentType`); anything posting
+  JSON as text, or as a form, has to change.
 - **Error answers are `application/problem+json`**, not the reason phrase
   as text. Tests asserting an error's body change, and so does whatever
   reads one.

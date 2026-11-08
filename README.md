@@ -92,8 +92,9 @@ const Signup = struct {
 
 ## Routes
 
-- `router.on(.PUT, pattern, app, handler)`, or `get` and `post` for short.
-  A method and path added twice is `error.DuplicateRoute`.
+- `router.on(.PUT, pattern, app, handler)`, or `get`, `post`, `put`,
+  `patch` and `delete` for short. A method and path added twice is
+  `error.DuplicateRoute`.
 - `router.scope(prefix)` puts routes under a prefix known at run time,
   from a config file say: `router.scope(opts.api).get("/:id", ...)`.
 - `router.addAll(&other)` adds another router's routes.
@@ -102,8 +103,19 @@ const Signup = struct {
   with it empty. Static segments win over params (`/items/new` before
   `/items/:id`), params over a catch-all, and a path that leads nowhere
   one way tries the next. A known path with another
-  method is 405 with `Allow`; HEAD takes GET's route.
-- What no route has goes back to the server: static files, a 404.
+  method is 405 with `Allow`, `error.MethodNotAllowed` on its way, so a
+  scope's `errors` may word it; HEAD takes GET's route.
+- What no route has goes back to the server: static files, a 404. A
+  scope's `fallback(app, handler)` takes what its prefix's routes don't,
+  any method: `router.scope("/api").fallback({}, notFound)` gives an API
+  its own 404 (`return error.NotFound`) and leaves `/` to static files.
+- A JSON body comes as `application/json` (or none): a cross-site form
+  can't post one unasked. Another `Content-Type` is 415, unless the spec
+  takes `.form = true` and it's `application/x-www-form-urlencoded`, read
+  as a query is.
+- `ctx.request.cookie(name)` reads a cookie; `ctx.setCookie(name, value,
+  .{ .max_age = 3600 })` sets one, `Secure`, `HttpOnly` and `SameSite=Lax`
+  unless it says otherwise, and `ctx.response.clearCookie` drops it.
 
 ## Endpoints, declared once
 

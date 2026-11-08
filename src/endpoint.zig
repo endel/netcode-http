@@ -38,8 +38,12 @@ pub const Spec = struct {
     /// is required.
     query: type = struct {},
     /// `void` for none, `[]const u8` for the bytes as they came, any other
-    /// type parsed from JSON.
+    /// type parsed from JSON. A JSON body sent as another `Content-Type` is
+    /// refused with 415: a cross-site form can't post one unasked.
     body: type = void,
+    /// The body may also come as an `application/x-www-form-urlencoded`
+    /// form, read as a query is: its fields are a query's kind.
+    form: bool = false,
     /// A longer body is refused with 413 before the handler runs.
     max_body: usize = 64 * 1024,
 };
@@ -96,6 +100,7 @@ pub const Shape = struct {
     params: type = struct {},
     query: type = struct {},
     body: type = void,
+    form: bool = false,
     max_body: usize = 64 * 1024,
     result: type = void,
     errors: []const Failure = &.{},
@@ -105,7 +110,7 @@ pub const Shape = struct {
 pub fn of(comptime method: Method, comptime path: []const u8, comptime s: Shape) Endpoint {
     if (catchAll(path)) @compileError(path ++ ": an endpoint's path has no catch-all");
     checkParams(path, paramNames(path), s.params);
-    const spec: Spec = .{ .params = s.params, .query = s.query, .body = s.body, .max_body = s.max_body };
+    const spec: Spec = .{ .params = s.params, .query = s.query, .body = s.body, .form = s.form, .max_body = s.max_body };
     return .{ .method = method, .path = path, .spec = spec, .result = s.result, .errors = s.errors };
 }
 
@@ -117,6 +122,9 @@ pub fn post(comptime path: []const u8, comptime s: Shape) Endpoint {
 }
 pub fn put(comptime path: []const u8, comptime s: Shape) Endpoint {
     return of(.PUT, path, s);
+}
+pub fn patch(comptime path: []const u8, comptime s: Shape) Endpoint {
+    return of(.PATCH, path, s);
 }
 pub fn delete(comptime path: []const u8, comptime s: Shape) Endpoint {
     return of(.DELETE, path, s);
@@ -201,6 +209,31 @@ pub fn decodeParams(comptime P: type, comptime names: []const []const u8, compti
 /// One pass over `raw`'s pairs; a field takes the first value named for it.
 /// A query it refuses, `why` (if given) says what's wrong with.
 pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator, why: ?*[]const u8) !Q {
+    return decodePairs(Q, raw, arena, why, "query");
+}
+
+/// An `application/x-www-form-urlencoded` body, read as a query is.
+pub fn decodeForm(comptime B: type, body: []const u8, arena: std.mem.Allocator, why: ?*[]const u8) !B {
+    return decodePairs(B, body, arena, why, "form");
+}
+
+/// Whether a `T` can come from a form: a struct of what a query's fields are.
+pub fn formable(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    for (@typeInfo(T).@"struct".field_types) |F| if (!scalar(F)) return false;
+    return true;
+}
+
+/// What a param, a query's field or a form's is: the types `parseScalar` reads.
+fn scalar(comptime T: type) bool {
+    return T == []const u8 or switch (@typeInfo(T)) {
+        .int, .float, .bool, .@"enum" => true,
+        .optional => |o| scalar(o.child),
+        else => false,
+    };
+}
+
+fn decodePairs(comptime Q: type, raw: []const u8, arena: std.mem.Allocator, why: ?*[]const u8, comptime where: []const u8) !Q {
     const s = @typeInfo(Q).@"struct";
     var q: Q = undefined;
     var seen: [s.field_names.len]bool = @splat(false);
@@ -213,7 +246,7 @@ pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator, 
             if (!seen[i] and std.mem.eql(u8, key, name)) {
                 const value = try percentDecode(arena, if (eq < pair.len) pair[eq + 1 ..] else "", true);
                 @field(q, name) = parseScalar(T, value) catch {
-                    if (why) |w| w.* = "query." ++ name ++ ": not " ++ comptime kind(T);
+                    if (why) |w| w.* = where ++ "." ++ name ++ ": not " ++ comptime kind(T);
                     return error.BadRequest;
                 };
                 seen[i] = true;
@@ -226,11 +259,11 @@ pub fn decodeQuery(comptime Q: type, raw: []const u8, arena: std.mem.Allocator, 
         else if (@typeInfo(T) == .optional)
             null
         else {
-            if (why) |w| w.* = "query." ++ name ++ " is required";
+            if (why) |w| w.* = where ++ "." ++ name ++ " is required";
             return error.BadRequest;
         };
     }
-    return keepsRules(Q, q, "query", arena, why);
+    return keepsRules(Q, q, where, arena, why);
 }
 
 /// `body` as `B`: `void` for none, `[]const u8` as it came, any other
@@ -295,6 +328,7 @@ pub fn percentDecode(arena: std.mem.Allocator, text: []const u8, plus_is_space: 
 }
 
 pub fn parseScalar(comptime T: type, text: []const u8) !T {
+    if (comptime !scalar(T)) @compileError("a param or query field can't be " ++ @typeName(T));
     if (T == []const u8) return text;
     return switch (@typeInfo(T)) {
         .int => std.fmt.parseInt(T, text, 10),
@@ -307,7 +341,7 @@ pub fn parseScalar(comptime T: type, text: []const u8) !T {
             error.InvalidCharacter,
         .@"enum" => std.meta.stringToEnum(T, text) orelse error.InvalidCharacter,
         .optional => |o| try parseScalar(o.child, text),
-        else => @compileError("a param or query field can't be " ++ @typeName(T)),
+        else => unreachable, // not `scalar`
     };
 }
 
@@ -434,6 +468,7 @@ pub fn decodeAnswer(comptime e: Endpoint, status: u16, body: []const u8, arena: 
 /// A param or query value, as `parseScalar` reads it back.
 fn writeScalar(w: *Writer, v: anytype) Writer.Error!void {
     const T = @TypeOf(v);
+    if (comptime !scalar(T)) @compileError("a param or query field can't be " ++ @typeName(T));
     if (T == []const u8) return std.Uri.Component.percentEncode(w, v, isUnreserved);
     switch (@typeInfo(T)) {
         .int => try w.print("{d}", .{v}),
@@ -441,7 +476,7 @@ fn writeScalar(w: *Writer, v: anytype) Writer.Error!void {
         .bool => try w.writeAll(if (v) "true" else "false"),
         .@"enum" => try std.Uri.Component.percentEncode(w, @tagName(v), isUnreserved),
         .optional => if (v) |x| try writeScalar(w, x),
-        else => @compileError("a param or query field can't be " ++ @typeName(T)),
+        else => unreachable, // not `scalar`
     }
 }
 

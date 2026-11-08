@@ -34,6 +34,30 @@ const Route = struct {
     max_body: usize,
 };
 
+/// The body by its `Content-Type`: JSON, the spec's `form` if it takes one,
+/// 415 for anything else. None at all is read as JSON.
+fn decodeBody(comptime spec: endpoint.Spec, req: *const Request, arena: std.mem.Allocator, why: *[]const u8) !spec.body {
+    const B = spec.body;
+    if (comptime B == void or B == []const u8) return endpoint.decodeBody(B, req.body, arena, why);
+    const t = req.header("content-type") orelse return endpoint.decodeBody(B, req.body, arena, why);
+    if (isMedia(t, "application/json") or jsonSuffix(t)) return endpoint.decodeBody(B, req.body, arena, why);
+    if (spec.form and isMedia(t, "application/x-www-form-urlencoded")) return endpoint.decodeForm(B, req.body, arena, why);
+    why.* = if (spec.form) "body: JSON or a form, by its Content-Type" else "body: JSON, by its Content-Type";
+    return error.UnsupportedMediaType;
+}
+
+/// Whether `content_type`, its parameters aside, is `media`.
+fn isMedia(content_type: []const u8, media: []const u8) bool {
+    const end = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, content_type[0..end], " \t"), media);
+}
+
+/// `application/problem+json` and the like.
+fn jsonSuffix(content_type: []const u8) bool {
+    const end = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    return std.ascii.endsWithIgnoreCase(std.mem.trim(u8, content_type[0..end], " \t"), "+json");
+}
+
 /// A request its spec refuses: `why` as the problem's detail.
 fn refuse(c: *Call, err: anyerror, why: []const u8) anyerror {
     if (why.len > 0) c.response.problem(context.statusOf(err), why);
@@ -69,7 +93,7 @@ fn route(comptime pattern: []const u8, comptime handler: anytype) Route {
             var ctx: Ctx = .{
                 .params = try endpoint.decodeParams(Ctx.web_spec.params, names, rest, captures, arena),
                 .query = endpoint.decodeQuery(Ctx.web_spec.query, c.request.rawQuery(), arena, &why) catch |err| return refuse(c, err, why),
-                .body = endpoint.decodeBody(Ctx.web_spec.body, c.request.body, arena, &why) catch |err| return refuse(c, err, why),
+                .body = decodeBody(Ctx.web_spec, &c.request, arena, &why) catch |err| return refuse(c, err, why),
                 .request = &c.request,
                 .response = &c.response,
                 .arena = arena,
@@ -256,6 +280,19 @@ pub const Router = struct {
     pub fn post(self: *Router, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
         return self.on(.POST, pattern, app, handler);
     }
+    pub fn put(self: *Router, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        return self.on(.PUT, pattern, app, handler);
+    }
+    pub fn patch(self: *Router, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        return self.on(.PATCH, pattern, app, handler);
+    }
+    pub fn delete(self: *Router, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        return self.on(.DELETE, pattern, app, handler);
+    }
+    /// `Scope.fallback` for every path: the transport's static files and 404 never come.
+    pub fn fallback(self: *Router, app: anytype, comptime handler: anytype) !void {
+        return self.scope("").fallback(app, handler);
+    }
     pub fn bind(self: *Router, comptime e: endpoint.Endpoint, app: anytype, comptime handler: anytype) !void {
         return self.scope("").bind(e, app, handler);
     }
@@ -338,15 +375,16 @@ pub const Router = struct {
     }
 
     /// 405, or 204 for OPTIONS, with the methods the path takes.
-    fn allow(node: *const Node, method: Method, res: *Response) void {
+    fn allow(node: *const Node, method: Method, res: *Response) !void {
         var names: [std.enums.values(Method).len][]const u8 = undefined;
         var n: usize = 0;
         for (std.enums.values(Method)) |m| if (targetOf(node, m) != null) {
             names[n] = @tagName(m);
             n += 1;
         };
-        res.setHeader("Allow", std.mem.join(res.arena, ", ", names[0..n]) catch "") catch {};
-        if (method != .OPTIONS) res.fail(405); // unanswered, it's a 204
+        try res.setHeader("Allow", try std.mem.join(res.arena, ", ", names[0..n]));
+        // Through the error path, so a scope's `errors` may word it. OPTIONS, unanswered, is a 204.
+        if (method != .OPTIONS) return error.MethodNotAllowed;
     }
 };
 
@@ -459,6 +497,30 @@ pub const Scope = struct {
     }
 
     pub fn on(self: Scope, comptime method: Method, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        const path = try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, pattern });
+        return self.router.insert(method, path, self.targetFor(pattern, app, handler));
+    }
+
+    /// What a path under the scope's prefix that no route has leads to, any
+    /// method: an API's own 404 say, in place of the transport's (static
+    /// files, a 404). It's a last `*` for each method the prefix's own
+    /// catch-all, if any, doesn't take; `error.DuplicateRoute` when it takes
+    /// them all.
+    pub fn fallback(self: Scope, app: anytype, comptime handler: anytype) !void {
+        const path = try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, "/*fallback" });
+        const target = self.targetFor("/", app, handler);
+        var added = false;
+        for (std.enums.values(Method)) |m| {
+            self.router.insert(m, path, target) catch |err| switch (err) {
+                error.DuplicateRoute => continue,
+                else => return err,
+            };
+            added = true;
+        }
+        if (!added) return error.DuplicateRoute;
+    }
+
+    fn targetFor(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) Router.Target {
         const r = comptime route(pattern, handler);
         const App = @TypeOf(app);
         if (r.App == void) {
@@ -467,8 +529,7 @@ pub const Scope = struct {
             @compileError(pattern ++ ": its handler takes " ++ @typeName(r.App) ++ ", not " ++ @typeName(App));
         }
         const ptr: ?*anyopaque = if (App == void) null else @ptrCast(@constCast(app));
-        const path = try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, pattern });
-        return self.router.insert(method, path, .{
+        return .{
             .thunk = r.thunk,
             .app = ptr,
             .max_body = self.max_body orelse r.max_body,
@@ -477,13 +538,22 @@ pub const Scope = struct {
             .deadline_ns = self.deadline_ns,
             .gate = self.gate,
             .errors = self.answers,
-        });
+        };
     }
     pub fn get(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
         return self.on(.GET, pattern, app, handler);
     }
     pub fn post(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
         return self.on(.POST, pattern, app, handler);
+    }
+    pub fn put(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        return self.on(.PUT, pattern, app, handler);
+    }
+    pub fn patch(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        return self.on(.PATCH, pattern, app, handler);
+    }
+    pub fn delete(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {
+        return self.on(.DELETE, pattern, app, handler);
     }
 
     /// `handler` as endpoint `e` (`http.endpoint`), checked against its

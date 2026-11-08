@@ -268,10 +268,16 @@ const Signup = struct {
 
 fn signup(_: *http.Context(.{ .body = Signup, .query = struct { page: u8 = 1, sort: enum { name, age } = .name } })) !void {}
 
-/// The detail of the problem `target` answers with `body`.
+fn signupByForm(_: *http.Context(.{ .body = Signup, .form = true })) !void {}
+
+/// The detail of the problem `target` answers with, `status`, given `body`.
 fn refusal(c: *http.testing.Client, target: []const u8, body: []const u8) ![]const u8 {
-    const answer = try c.request(.POST, target, .{ .body = body });
-    try expectEqual(400, answer.status.?);
+    return refusalAs(c, 400, target, &.{}, body);
+}
+
+fn refusalAs(c: *http.testing.Client, status: u16, target: []const u8, headers: []const http.Header, body: []const u8) ![]const u8 {
+    const answer = try c.request(.POST, target, .{ .headers = headers, .body = body });
+    try expectEqual(status, answer.status.?);
     const Problem = struct { detail: []const u8 };
     return (try std.json.parseFromSliceLeaky(Problem, c.arena.allocator(), answer.body, .{ .ignore_unknown_fields = true })).detail;
 }
@@ -291,4 +297,89 @@ test "a refused query or body says why: the field, and what it broke" {
     try expectEqualStrings("body, line 1 column 11: a required field is missing", try refusal(&c, "/signup", "{\"age\":20}"));
     try expectEqualStrings("body.name: at least 1 byte long", try refusal(&c, "/signup", "{\"name\":\"\",\"age\":20}"));
     try expectEqualStrings("body.age: at least 13", try refusal(&c, "/signup", "{\"name\":\"ann\",\"age\":9}"));
+}
+
+fn missing(_: *http.Context(.{})) !void {
+    return error.NotFound;
+}
+
+fn item(ctx: *http.Context(.{ .params = struct { id: u32 } })) !u32 {
+    return ctx.params.id;
+}
+
+test "put, patch and delete; a fallback for paths under a prefix no route has; a 405 its scope words" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    const items = try r.scope("/items").errors(&.{.{ .err = error.MethodNotAllowed, .status = 405, .detail = "an item is put, patched or deleted" }});
+    try items.put("/:id", {}, item);
+    try items.patch("/:id", {}, item);
+    try items.delete("/:id", {}, item);
+    const api = r.scope("/api");
+    try api.fallback({}, missing);
+    try std.testing.expectError(error.DuplicateRoute, api.fallback({}, missing));
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+
+    try expectEqualStrings("7", (try c.request(.DELETE, "/items/7", .{})).body);
+    try expectEqualStrings("8", (try c.request(.PATCH, "/items/8", .{})).body);
+    const nowhere = try c.request(.POST, "/api/nowhere/at/all", .{});
+    try expectEqual(404, nowhere.status.?);
+    try expectEqualStrings("application/problem+json", nowhere.header("content-type").?);
+    try expectEqual(404, (try c.get("/api")).status.?);
+    // Outside it, the transport's own: static files, its 404.
+    try expectEqual(null, (try c.get("/elsewhere")).status);
+    const wrong = try c.get("/items/1");
+    try expectEqual(405, wrong.status.?);
+    try expectEqualStrings("PUT, PATCH, DELETE", wrong.header("allow").?);
+    try expectEqualStrings("{\"title\":\"Method Not Allowed\",\"status\":405,\"detail\":\"an item is put, patched or deleted\"}", wrong.body);
+}
+
+fn session(ctx: *http.Context(.{})) ![]const u8 {
+    try ctx.setCookie("seen", "yes", .{ .max_age = 60 });
+    return ctx.request.cookie("sid") orelse "none";
+}
+
+test "cookies: read from the request, set on the answer; one a cookie can't hold is refused" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.get("/me", {}, session);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+
+    const me = try c.request(.GET, "/me", .{ .headers = &.{
+        .{ .name = "Cookie", .value = "a=1; b=2" },
+        .{ .name = "Cookie", .value = "sid=\"abc\"" },
+    } });
+    try expectEqualStrings("\"abc\"", me.body);
+    try expectEqualStrings("seen=yes; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Lax", me.header("set-cookie").?);
+    try expectEqualStrings("\"none\"", (try c.get("/me")).body);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var res: http.Response = .init(arena.allocator());
+    try std.testing.expectError(error.InvalidCookie, res.setCookie("a b", "x", .{}));
+    try std.testing.expectError(error.InvalidCookie, res.setCookie("a", "x;y", .{}));
+    try std.testing.expectError(error.InvalidCookie, res.setCookie("a", "x", .{ .secure = false, .same_site = .none }));
+    try res.clearCookie("sid", .{ .path = "/app", .same_site = .strict });
+    try expectEqualStrings("sid=; Path=/app; Max-Age=0; Secure; HttpOnly; SameSite=Strict", res.headers.items[0].value);
+}
+
+test "a body by its Content-Type: JSON, a form where the spec takes one, 415 otherwise" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.post("/signup", {}, signup);
+    try r.post("/signup/form", {}, signupByForm);
+    var c: http.testing.Client = .init(std.testing.allocator, &r);
+    defer c.deinit();
+    const form: []const http.Header = &.{.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded; charset=UTF-8" }};
+    const json: []const http.Header = &.{.{ .name = "content-type", .value = "Application/JSON" }};
+    const text: []const http.Header = &.{.{ .name = "Content-Type", .value = "text/plain" }};
+    const ann = "{\"name\":\"ann\",\"age\":20}";
+
+    try expectEqual(204, (try c.request(.POST, "/signup/form", .{ .headers = form, .body = "name=ann+lee&age=20" })).status.?);
+    try expectEqual(204, (try c.request(.POST, "/signup/form", .{ .headers = json, .body = ann })).status.?);
+    try expectEqualStrings("form.age: at least 13", try refusalAs(&c, 400, "/signup/form", form, "name=ann&age=9"));
+    try expectEqualStrings("body: JSON, by its Content-Type", try refusalAs(&c, 415, "/signup", form, "name=ann&age=20"));
+    // A cross-site form posts text/plain without asking first: refused, though it parses.
+    try expectEqualStrings("body: JSON, by its Content-Type", try refusalAs(&c, 415, "/signup", text, ann));
 }

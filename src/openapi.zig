@@ -81,7 +81,8 @@ fn operation(comptime n: api.Named) []const u8 {
     if (s.body != void) out = out ++ ",\"requestBody\":{\"required\":true,\"content\":{" ++ if (s.body == []const u8)
         "\"application/octet-stream\":{\"schema\":{\"type\":\"string\",\"format\":\"binary\"}}}}"
     else
-        "\"application/json\":{\"schema\":" ++ schema(s.body, .{}) ++ "}}}";
+        "\"application/json\":{\"schema\":" ++ schema(s.body, .{}) ++ "}" ++
+            (if (s.form) ",\"application/x-www-form-urlencoded\":{\"schema\":" ++ schema(s.body, .{}) ++ "}" else "") ++ "}}";
     out = out ++ ",\"responses\":{" ++ if (e.result == void)
         "\"204\":{\"description\":\"No Content\"}"
     else

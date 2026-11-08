@@ -37,7 +37,7 @@ Independent of 1.
 6. **In.** Validation with field-level messages, through 5's body.
 7. **In.** Typed errors in endpoint contracts for the TypeScript client, then
    OpenAPI, once the error shapes have settled.
-8. Small ones together: `put`/`patch`/`delete` shortcuts, cookies,
+8. **In.** Small ones together: `put`/`patch`/`delete` shortcuts, cookies,
    urlencoded forms, an app's own 404 and 405.
 
 ### 3. Streaming (`streaming.md`)
