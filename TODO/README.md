@@ -10,22 +10,53 @@ Surveyed 2026-11-08 against this repo at 882c11d and quic-zig as pinned.
 
 ## Order of work
 
-1. `blocking.md`: handlers that may block. The first wall a typical API hits,
-   since most of its handlers query a database. Phase 1 is in.
-2. `streaming.md`: bodies in and out as they flow, SSE, WebSocket and
-   WebTransport routes.
-3. `api.md`: structured errors and validation, then middleware that hands
-   data to handlers, then cookies and forms.
-4. `server.md`: a standalone server with TLS, HTTP/3 and every core. Static
-   files and HTTP/2 also live there.
+Item by item. API breaks go early, before anyone outside netcode
+depends on the API.
 
-Those four take it from "a router for my server" to "an API framework
-someone else could pick". After them, no fixed order:
+### 1. Finish blocking scopes (`blocking.md`)
 
-- `web-app.md`: sessions, CSRF, templates, compression. Only needed if the
-  aim goes past APIs.
-- `operations.md`: request IDs, logs, metrics, tracing, auth built-ins.
-- `packaging.md`: the quic-zig pin, docs, examples, test helpers, naming.
+1. Cancellation and deadlines. A handler whose client left still holds its
+   task, so under a slow database the abandoned ones use up the `Io`'s
+   room and everything else is 503. The per-request cancel handle is
+   reused for streaming.
+2. `ctx.onLoop(func, args)`. Small, and what makes blocking scopes usable
+   for netcode: game state read without locks.
+3. Middleware rework (`api.md`): typed locals handed to the handler,
+   middleware around the handler, and `before` on the `io` in blocking
+   scopes. One break to the middleware API instead of three.
+4. Retire `Pool` and `ctx.offload`, once 1-3 cover what they're for.
+
+### 2. API essentials (`api.md`)
+
+Independent of 1.
+
+5. Structured errors: `problem+json`, a message the handler picks, an
+   error-to-answer hook.
+6. Validation with field-level messages, through 5's body.
+7. Typed errors in endpoint contracts for the TypeScript client, then
+   OpenAPI, once the error shapes have settled.
+8. Small ones together: `put`/`patch`/`delete` shortcuts, cookies,
+   urlencoded forms, an app's own 404 and 405.
+
+### 3. Streaming (`streaming.md`)
+
+9. Streaming responses and SSE, sending from blocking handlers over 1's
+   cancel handle.
+10. Streaming request bodies, then multipart on top.
+11. WebSocket and WebTransport routes, so 3's middleware runs on upgrades.
+
+### 4. Standing alone (`server.md`, `packaging.md`)
+
+12. A standalone server: TLS, HTTP/3 and every core in one call, graceful
+    drain, timeouts for slow bodies and headers.
+13. Packaging: the quic-zig pin, docs and a CRUD-on-a-database example,
+    the Zig version policy. Then a first public release, maybe the rename.
+
+### Later, unordered
+
+Static files, compression, request IDs, logs and metrics, HTTP/2,
+`web-app.md`, the zio spike (`blocking.md` phase 6), handlers as fibers on
+the loop (phase 7).
 
 ## Out of scope
 
