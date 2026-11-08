@@ -62,7 +62,8 @@ Independent of 1.
 Per request, after the router's cost was measured against raw quic-zig
 (0.3 µs, 2026-11-08): a bodiless request answered inside its head's
 callback, with no copy of the head (HTTP/3 needs quic-zig to say a
-request's stream ended with its head); a buffer of the `Pending`'s own
+request's stream ended with its head); `find` writing into the request's
+`Pending`, not copying `Found` three times; a buffer of the `Pending`'s own
 before its arena, whose allocations are atomic in Zig 0.17.
 
 Static files, compression, request IDs, logs and metrics, HTTP/2,
