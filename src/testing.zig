@@ -24,6 +24,8 @@ pub const Answer = struct {
     status: ?u16,
     headers: []const context.Header = &.{},
     body: []const u8 = "",
+    /// Reset before it ended: a stream cut off.
+    cut: bool = false,
 
     pub fn header(self: Answer, name: []const u8) ?[]const u8 {
         return getHeader(self.headers, name);
@@ -104,7 +106,7 @@ pub const Client = struct {
         }
         while (ex.answer != .done and back.mailbox.watching) try back.loop.run(.once);
         if (ex.answer != .done) return error.Unanswered;
-        return .{ .status = fake.status, .headers = fake.headers.items, .body = fake.sent.items };
+        return .{ .status = fake.status, .headers = fake.headers.items, .body = fake.sent.items, .cut = fake.cut };
     }
 
     pub fn get(self: *Client, target: []const u8) !Answer {
@@ -122,6 +124,7 @@ const Fake = struct {
     status: u16 = 0,
     headers: std.ArrayList(context.Header) = .empty,
     sent: std.ArrayList(u8) = .empty,
+    cut: bool = false,
     address: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage),
 
     const vtable: Exchange.VTable = .{
@@ -129,7 +132,7 @@ const Fake = struct {
         .head = head,
         .body = body,
         .end = noop,
-        .reset = noop,
+        .reset = reset,
         .buffered = buffered,
         .cork = cork,
     };
@@ -157,6 +160,10 @@ const Fake = struct {
     }
 
     fn noop(_: *anyopaque) void {}
+
+    fn reset(ptr: *anyopaque) void {
+        of(ptr).cut = true;
+    }
 
     fn buffered(_: *anyopaque) usize {
         return 0;

@@ -26,12 +26,18 @@ const Admin = struct {
 
 /// Sends `request` and reads until the server closes.
 fn fetch(port: u16, request: []const u8, buf: []u8) ![]const u8 {
+    return fetchAfter(port, request, buf, 0);
+}
+
+/// `fetch`, waiting `ms` before reading: a client that falls behind.
+fn fetchAfter(port: u16, request: []const u8, buf: []u8, ms: u64) ![]const u8 {
     const fd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     defer sys.close(fd);
     const addr = try quic.sockaddr.Address.parseIp4("127.0.0.1", port);
     if (std.c.connect(fd, &addr.any, addr.getOsSockLen()) != 0) return error.ConnectionRefused;
     const out: sys.File = .{ .fd = fd };
     try out.writeAll(request);
+    sys.sleepNs(ms * std.time.ns_per_ms);
     var len: usize = 0;
     while (len < buf.len) {
         const n = std.c.read(fd, buf[len..].ptr, buf.len - len);
@@ -437,4 +443,104 @@ test "on a server: a scope's max_running holds the rest back, max_waiting of the
     running.join();
     waiting.join();
     for (bufs, lens) |b, n| try expectEqualStrings("done", bodyOf(b[0..n]));
+}
+
+const Feed = struct {
+    fn letters(_: *Feed, ctx: *http.Context(.{})) !void {
+        const s = try ctx.stream(200, "text/plain");
+        try s.write("a");
+        try s.writeAll(&.{ "b", "c" });
+    }
+
+    /// Rows printed into a writer's buffer: one trip for all three.
+    fn rows(_: *Feed, ctx: *http.Context(.{})) !void {
+        var buf: [256]u8 = undefined;
+        var out = (try ctx.stream(200, "application/x-ndjson")).writer(&buf);
+        for (0..3) |i| try out.interface.print("{{\"n\":{d}}}\n", .{i});
+        try out.interface.flush();
+    }
+
+    fn scores(_: *Feed, ctx: *http.Context(.{})) !void {
+        const events = try ctx.events();
+        try events.send(null, "hello\nworld");
+        try events.send("score", "{\"ann\":3}");
+        try events.comment("still here");
+    }
+
+    fn broken(_: *Feed, ctx: *http.Context(.{})) !void {
+        const s = try ctx.stream(200, "text/plain");
+        try s.write("half");
+        return error.Unexpected;
+    }
+
+    fn slow(_: *Feed, ctx: *http.Context(.{})) !void {
+        const s = try ctx.stream(200, "text/plain");
+        try s.write("first");
+        try ctx.io.sleep(.fromSeconds(10), .awake);
+        try s.write("never");
+    }
+
+    /// 4 MiB in 64 KiB pieces: past what a socket takes at once.
+    fn big(_: *Feed, ctx: *http.Context(.{})) !void {
+        const s = try ctx.stream(200, "application/octet-stream");
+        const piece: [64 * 1024]u8 = @splat('x');
+        for (0..64) |_| try s.write(&piece);
+    }
+};
+
+test "a blocking handler streams its answer: pieces, server-sent events, cut off by an error or its deadline" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var feed: Feed = .{};
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    const api = try router.scope("").blocking(threaded.io(), .{ .deadline = .fromMilliseconds(100) });
+    try api.get("/letters", &feed, Feed.letters);
+    try api.get("/scores", &feed, Feed.scores);
+    try api.get("/rows", &feed, Feed.rows);
+    try api.get("/broken", &feed, Feed.broken);
+    try api.get("/slow", &feed, Feed.slow);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    const letters = try c.get("/letters");
+    try expectEqualStrings("abc", letters.body);
+    try expectEqualStrings("text/plain", letters.header("content-type").?);
+    try expectEqual(false, letters.cut);
+
+    try expectEqualStrings("{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n", (try c.get("/rows")).body);
+
+    const scores = try c.get("/scores");
+    try expectEqualStrings("data: hello\ndata: world\n\nevent: score\ndata: {\"ann\":3}\n\n: still here\n\n", scores.body);
+    try expectEqualStrings("text/event-stream", scores.header("content-type").?);
+    try expectEqualStrings("no-cache", scores.header("cache-control").?);
+
+    const broken = try c.get("/broken");
+    try expectEqual(200, broken.status.?);
+    try expectEqualStrings("half", broken.body);
+    try expectEqual(true, broken.cut);
+
+    const slow = try c.get("/slow");
+    try expectEqualStrings("first", slow.body);
+    try expectEqual(true, slow.cut);
+}
+
+test "on a server: a stream past what the socket takes waits for the client, and arrives whole" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var feed: Feed = .{};
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("").blocking(threaded.io(), .{})).get("/big", &feed, Feed.big);
+    const server = try http.Server.create(gpa, &router, .{});
+    defer server.destroy();
+
+    const buf = try gpa.alloc(u8, 5 << 20);
+    defer gpa.free(buf);
+    const got = try fetchAfter(server.port(), "GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", buf, 300);
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try std.testing.expect(std.mem.endsWith(u8, got, "\r\n0\r\n\r\n"));
+    try expectEqual(64 * 1024 * 64, std.mem.count(u8, bodyOf(got), "x"));
 }

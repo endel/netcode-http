@@ -267,6 +267,31 @@ A scope's `max_running` runs fewer at once than the `Io` takes, one compile
 at a time say: `max_waiting` more wait their turn (64 unless it says), the
 rest are 503. A wait is canceled as running would be.
 
+## Streams
+
+A blocking handler can answer as it goes: `ctx.stream(status, type)` sends
+the head and the headers set so far, then each `write` a piece, waiting
+while the client is behind. It ends when the handler returns. An error
+from it, or its deadline, cuts the stream off, so the client can tell.
+
+```zig
+fn export_(db: *Db, ctx: *http.Context(.{})) !void {
+    const out = try ctx.stream(200, "application/x-ndjson");
+    var rows = try db.rows(ctx.io);
+    while (try rows.next()) |row| try out.writeAll(&.{ row.json, "\n" });
+}
+```
+
+`stream.writer(&buf)` is a `std.Io.Writer` over it: `print`s and JSON
+gather in `buf` and go in one trip when it fills or on `flush`, cheaper
+than a trip per small write.
+
+`ctx.events()` is a stream of server-sent events: `send(name, data)`, a
+`data:` line per line of `data`, and `comment(text)` to keep a quiet one
+alive through proxies. Each holds a blocking task for as long as it's
+open, so it suits a few clients each; a game pushing to many wants a
+stream written from the loop, which isn't here yet (TODO/streaming.md).
+
 ## A listener of its own
 
 `http.Server` serves a router on an HTTP/1.1 listener of its own, with a
@@ -296,6 +321,9 @@ pub fn onHttpEnd(self: *App, ex: *quic.event_loop.Exchange) void {
 }
 pub fn onHttpGone(self: *App, ex: *quic.event_loop.Exchange) void {
     self.host.onHttpGone(ex);
+}
+pub fn onHttpWritable(self: *App, ex: *quic.event_loop.Exchange) void {
+    self.host.onHttpWritable(ex); // a stream's client caught up
 }
 ```
 

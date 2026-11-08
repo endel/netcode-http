@@ -18,6 +18,8 @@ the commits that changed these. Then:
 - **Error answers are `application/problem+json`**, not the reason phrase
   as text. Tests asserting an error's body change, and so does whatever
   reads one.
+- **`Host.onHttpWritable`** wants forwarding from an embedding handler, as
+  `onHttpGone` is, for blocking handlers' streams.
 - **Custom middleware** takes `*http.Call` (`before`, `after`) and
   `http.Next` (`around`). netcode only uses the built-ins, whose
   `.middleware()` is unchanged.

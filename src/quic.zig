@@ -40,6 +40,10 @@ pub const Host = struct {
         off: ?*OffLoop = null,
     };
 
+    /// From here quic-zig's HTTP/1.1 and HTTP/3 alike owe `onHttpWritable`:
+    /// their own marks, copied (TODO/streaming.md).
+    const writable_mark = 64 * 1024;
+
     /// A blocking handler's task, in its request's arena. It posts `done`
     /// when the handler returns, and the reaper `task.reaped` once it's
     /// collected, which frees the request.
@@ -48,6 +52,9 @@ pub const Host = struct {
         reaper: *Reaper,
         task: reaper_mod.Task,
         done: Mailbox.Post = .{ .run = doneOffLoop },
+        /// The handler returned an error: a stream it started is cut off.
+        failed: bool = false,
+        stream: context.Stream,
     };
 
     pub fn init(gpa: std.mem.Allocator, router: *const Router) Host {
@@ -97,9 +104,16 @@ pub const Host = struct {
         answer(p);
     }
 
+    /// What a blocking handler's stream wrote has been read: it may write more.
+    pub fn onHttpWritable(_: *Host, ex: *Exchange) void {
+        const p = pendingOf(ex) orelse return;
+        giveRoom(p, false);
+    }
+
     pub fn onHttpGone(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
         p.ex = null;
+        giveRoom(p, true);
         // Still running: cancel it. Otherwise its `done` is on the way.
         if (p.off) |off| {
             if (off.task.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null) off.reaper.end(&off.task);
@@ -115,7 +129,7 @@ pub const Host = struct {
         const target = p.found.target.?;
         if (target.gate) |g| if (!g.enter()) return fail(p, 503);
         const off = p.arena.allocator().create(OffLoop) catch return fail(p, 500);
-        off.* = .{ .p = p, .reaper = r, .task = .{
+        off.* = .{ .p = p, .reaper = r, .stream = .{ .call = &p.call, .post = .{ .run = streamOnLoop } }, .task = .{
             .mailbox = mailbox,
             .reaped = .{ .run = reapedOffLoop },
             .deadline = if (target.deadline_ns) |ns| .fromNow(r.io, .{ .raw = .fromNanoseconds(ns), .clock = .awake }) else null,
@@ -124,12 +138,14 @@ pub const Host = struct {
         mailbox.expect(); // task.reaped
         p.call.io = r.io;
         p.call.loop = mailbox;
+        p.call.stream = &off.stream;
         // Not `io.async`: with no thread free, Threaded runs that here, on the loop.
         off.task.future = r.io.concurrent(runOffLoop, .{off}) catch {
             mailbox.forget();
             mailbox.forget();
             p.call.io = .failing;
             p.call.loop = null;
+            p.call.stream = null;
             if (target.gate) |g| g.leave();
             return fail(p, 503);
         };
@@ -144,7 +160,10 @@ pub const Host = struct {
         if (gate) |g| g.leave();
         // Lost to the deadline or the client: the answer is the reaper's, or nobody's.
         if (off.task.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) == null) {
-            result catch |err| p.found.failWith(&p.call, err);
+            result catch |err| {
+                off.failed = true;
+                p.found.failWith(&p.call, err);
+            };
         }
         off.task.mailbox.post(&off.done);
     }
@@ -161,7 +180,17 @@ pub const Host = struct {
         const p = off.p;
         p.call.io = .failing; // `after` runs here, on the loop
         p.call.loop = null;
-        switch (off.task.state.load(.acquire)) {
+        const state = off.task.state.load(.acquire);
+        if (p.call.response.streamed) {
+            // Its head is out: finished whole, or cut off so the client can tell.
+            if (p.ex) |ex| {
+                ex.user_data = null;
+                if (state == .finished and !off.failed) ex.finish() else ex.abort();
+            }
+            if (state == .finished) off.reaper.end(&off.task);
+            return;
+        }
+        switch (state) {
             .running => unreachable,
             .finished => {
                 respond(p);
@@ -174,6 +203,52 @@ pub const Host = struct {
             },
             .abandoned => {},
         }
+    }
+
+    /// A stream's trip: its head the first time, then its pieces, on the loop.
+    fn streamOnLoop(post: *Mailbox.Post) void {
+        const s: *context.Stream = @alignCast(@fieldParentPtr("post", post));
+        const p: *Pending = @alignCast(@fieldParentPtr("call", s.call));
+        defer s.taken.set(p.call.io);
+        pour(p, s) catch {
+            s.closed = true;
+        };
+        if (!s.closed and p.ex.?.bufferedAmount() >= writable_mark) s.room_owed = true else s.room.set(p.call.io);
+    }
+
+    fn pour(p: *Pending, s: *context.Stream) !void {
+        const ex = p.ex orelse return error.Closed;
+        const res = &p.call.response;
+        if (!res.streamed) {
+            res.streamed = true;
+            res.answered = true;
+            try ex.sendHead(res.status, try headOf(p), null);
+        }
+        // One write, one chunk, for what fits here: an event is a handful of pieces.
+        var buf: [4096]u8 = undefined;
+        var len: usize = 0;
+        for (s.pieces) |piece| {
+            if (len + piece.len > buf.len) {
+                if (len > 0) try ex.write(buf[0..len]);
+                len = 0;
+                if (piece.len > buf.len) {
+                    try ex.write(piece);
+                    continue;
+                }
+            }
+            @memcpy(buf[len..][0..piece.len], piece);
+            len += piece.len;
+        }
+        if (len > 0) try ex.write(buf[0..len]);
+    }
+
+    /// The stream's client caught up, or left: its writer goes on.
+    fn giveRoom(p: *Pending, gone: bool) void {
+        const s = p.call.stream orelse return;
+        if (!s.room_owed) return;
+        s.room_owed = false;
+        s.closed = gone;
+        s.room.set(p.call.io);
     }
 
     fn reapedOffLoop(post: *Mailbox.Post) void {
@@ -202,11 +277,17 @@ pub const Host = struct {
         const ex = p.ex orelse return;
         ex.user_data = null;
         const res = &p.call.response;
+        ex.respond(res.status, headOf(p) catch return ex.abort(), res.body);
+    }
+
+    /// The answer's headers, `after` middleware's included, its Content-Type first when it has one.
+    fn headOf(p: *Pending) ![]const context.Header {
         for (p.found.middleware()) |m| if (m.after) |after| after(m.ctx, &p.call);
-        const headers = p.arena.allocator().alloc(context.Header, res.headers.items.len + 1) catch return ex.abort();
+        const res = &p.call.response;
+        const headers = try p.arena.allocator().alloc(context.Header, res.headers.items.len + 1);
         headers[0] = .{ .name = "Content-Type", .value = res.content_type orelse "" };
         @memcpy(headers[1..], res.headers.items);
-        ex.respond(res.status, if (res.content_type == null) headers[1..] else headers, res.body);
+        return if (res.content_type == null) headers[1..] else headers;
     }
 
     fn release(p: *Pending) void {

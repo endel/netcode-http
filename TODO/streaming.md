@@ -2,14 +2,26 @@
 
 ## Responses
 
-Answers are sent whole (`Exchange.respond`), so SSE, large downloads and
-output generated as it goes are out of reach. quic-zig's `Exchange` already
-streams: `sendHead`, `write`, `finish`, with `onHttpWritable` for
-backpressure (`quic-zig/src/http/exchange.zig`). `Host` only uses `respond`.
+**In:** `ctx.stream(status, type)` in a blocking handler: each `write` a
+trip to the loop, waiting on `onHttpWritable` once 64 KiB is queued (where
+quic-zig's HTTP/1.1 and HTTP/3 both owe it). An error or the deadline cuts
+it off with a reset. Left over:
 
-Needs a context API (say `ctx.stream(status, headers)` returning a writer)
-and a way to wait for `onHttpWritable`. From a blocking handler, every chunk
-has to hop to the loop: design it with `blocking.md`.
+- Streams from the loop, pushed to: a game broadcasting to its SSE
+  clients without a task per client. Needs a stream that outlives its
+  handler, written from loop code, with a callback when its client
+  leaves. This is the shape netcode wants at scale.
+- A write is two hops (to the loop and back), about 16 µs; `writer(buf)`
+  batches small ones. The loop joins a trip's pieces into one write, so
+  one chunk, up to 4 KiB.
+- `writable_mark` copies quic-zig's own 64 KiB marks: if quic-zig raises
+  them, a stream waits for an `onHttpWritable` that doesn't come, until
+  its deadline. `Exchange.write` saying whether one is owed would end the
+  copy.
+- No assertion that the 4 MiB test takes the wait-for-room path (it did,
+  checked by hand on macOS); a counter on `Host` would make it one.
+- `after` middleware runs when the head goes, so `access_log` logs a
+  stream's status with an empty body.
 
 ## Request bodies
 
@@ -21,9 +33,9 @@ the `Spec`, `.body = http.BodyStream`, say.
 
 ## SSE
 
-Streaming responses, plus a helper that frames `data:` and `event:` lines,
-sends keep-alive comments and closes cleanly. A typed variant could come
-from an endpoint's contract, with the TypeScript client reading it.
+**In:** `ctx.events()`: `send(name, data)` and `comment`, over a stream.
+Left over: `id:` and `retry:` fields, and a typed event stream in an
+endpoint's contract that the TypeScript client reads with `EventSource`.
 
 ## WebSocket and WebTransport routes
 

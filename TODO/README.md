@@ -42,7 +42,7 @@ Independent of 1.
 
 ### 3. Streaming (`streaming.md`)
 
-9. Streaming responses and SSE, sending from blocking handlers over 1's
+9. **In.** Streaming responses and SSE, sending from blocking handlers over 1's
    cancel handle.
 10. Streaming request bodies, then multipart on top.
 11. WebSocket and WebTransport routes, so 3's middleware runs on upgrades.

@@ -63,6 +63,8 @@ pub const Response = struct {
     headers: std.ArrayList(Header) = .empty,
     body: []const u8 = "",
     answered: bool = false,
+    /// Its head went as a stream's (`Context.stream`): the rest of it did, or will.
+    streamed: bool = false,
 
     pub fn init(arena: std.mem.Allocator) Response {
         return .{ .arena = arena };
@@ -200,6 +202,8 @@ pub const Call = struct {
     /// The request's `done` is owed meanwhile, so its watch is on and an
     /// `expect` off the loop only counts.
     loop: ?*Mailbox = null,
+    /// While a blocking handler runs: its answer as a stream (`Context.stream`).
+    stream: ?*Stream = null,
     /// What middleware left for the handler, one per type, in the arena.
     locals: ?*Local = null,
 
@@ -225,6 +229,119 @@ pub const Call = struct {
         var it = self.locals;
         while (it) |l| : (it = l.next) if (l.key == typeKey(T)) return @ptrCast(@alignCast(l.value));
         return null;
+    }
+};
+
+/// A blocking handler's answer as it's made (`Context.stream`): its head,
+/// then each `write`, one trip to the loop, waiting while the client is
+/// behind. It ends when the handler returns; an error from it, or a
+/// deadline passed, cuts it off, so the client can tell.
+pub const Stream = struct {
+    call: *Call,
+    /// Run on the loop by the transport (`Host`): takes `pieces`, then sets
+    /// `taken`, and `room` once the client can take more.
+    post: Mailbox.Post,
+    pieces: []const []const u8 = &.{},
+    taken: std.Io.Event = .unset,
+    room: std.Io.Event = .unset,
+    /// The client left, or the head couldn't go: set before either event.
+    closed: bool = false,
+    /// A wait was canceled: the stream is done for.
+    broken: bool = false,
+    /// The loop's own: the client is behind, and `onHttpWritable` will say when it isn't.
+    room_owed: bool = false,
+    /// What a `writer`'s `error.WriteFailed` was.
+    err: ?anyerror = null,
+
+    pub fn write(self: *Stream, bytes: []const u8) !void {
+        return self.writeAll(&.{bytes});
+    }
+
+    /// `pieces` in one trip to the loop.
+    pub fn writeAll(self: *Stream, pieces: []const []const u8) !void {
+        if (self.broken) return error.Canceled;
+        self.pieces = pieces;
+        self.taken = .unset;
+        self.room = .unset;
+        const loop = self.call.loop.?;
+        loop.expect(); // off the loop: see `Call.loop`
+        loop.post(&self.post);
+        self.taken.waitUncancelable(self.call.io); // a loop turn: `pieces` are the caller's till then
+        self.room.wait(self.call.io) catch |err| {
+            self.broken = true;
+            return err;
+        };
+        if (self.closed) return error.Closed;
+    }
+
+    /// `print`, JSON and the like gather in `buf`, and go in a trip when it
+    /// fills or on `flush`. Its `error.WriteFailed` is `err`.
+    pub fn writer(self: *Stream, buf: []u8) Writer {
+        return .{ .stream = self, .interface = .{ .vtable = &.{ .drain = Writer.drain }, .buffer = buf } };
+    }
+
+    pub const Writer = struct {
+        stream: *Stream,
+        interface: std.Io.Writer,
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *Writer = @alignCast(@fieldParentPtr("interface", w));
+            var pieces: [16][]const u8 = undefined;
+            pieces[0] = w.buffered();
+            var n: usize = 1;
+            var taken: usize = 0;
+            const head = data[0 .. data.len - 1];
+            for (head) |d| {
+                if (n == pieces.len) break;
+                pieces[n] = d;
+                n += 1;
+                taken += d.len;
+            } else for (0..splat) |_| {
+                if (n == pieces.len) break;
+                pieces[n] = data[data.len - 1];
+                n += 1;
+                taken += data[data.len - 1].len;
+            }
+            self.stream.writeAll(pieces[0..n]) catch |err| {
+                self.stream.err = err;
+                return error.WriteFailed;
+            };
+            w.end = 0;
+            return taken;
+        }
+    };
+};
+
+/// Server-sent events (`text/event-stream`), from a blocking handler (`Context.events`).
+pub const Events = struct {
+    stream: *Stream,
+
+    /// An event, `name` null for a plain message; each line of `data` its
+    /// own `data:`. One trip, unless it has more than 20 lines.
+    pub fn send(self: Events, name: ?[]const u8, data: []const u8) !void {
+        var pieces: [64][]const u8 = undefined;
+        var n: usize = 0;
+        if (name) |e| {
+            pieces[0..3].* = .{ "event: ", e, "\n" };
+            n = 3;
+        }
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            if (n + 4 > pieces.len) {
+                try self.stream.writeAll(pieces[0..n]);
+                n = 0;
+            }
+            pieces[n..][0..3].* = .{ "data: ", line, "\n" };
+            n += 3;
+        }
+        pieces[n] = "\n";
+        try self.stream.writeAll(pieces[0 .. n + 1]);
+    }
+
+    /// `: text`, which events' readers skip: keeps a quiet stream from
+    /// looking dead to a proxy.
+    pub fn comment(self: Events, text: []const u8) !void {
+        return self.stream.writeAll(&.{ ": ", text, "\n\n" });
     }
 };
 
@@ -293,6 +410,24 @@ pub fn Context(comptime spec: Spec) type {
         /// `send`, of a body that outlives the answer: not copied.
         pub fn sendOwned(self: *Self, status: u16, content_type: []const u8, body: []const u8) void {
             self.response.sendOwned(status, content_type, body);
+        }
+
+        /// The answer as it's made, from a blocking handler: `status`, the
+        /// headers set so far and `content_type` go now, the body a `write`
+        /// at a time (`Stream`). On the loop, `error.NotBlocking`.
+        pub fn stream(self: *Self, status: u16, content_type: []const u8) !*Stream {
+            const s = self.call.stream orelse return error.NotBlocking;
+            self.response.status = status;
+            self.response.content_type = content_type;
+            try s.writeAll(&.{});
+            return s;
+        }
+
+        /// Server-sent events, from a blocking handler: a 200 stream of
+        /// `text/event-stream`, not to be cached.
+        pub fn events(self: *Self) !Events {
+            try self.setHeader("Cache-Control", "no-cache");
+            return .{ .stream = try self.stream(200, "text/event-stream") };
         }
 
         /// `func(args)` on the event loop's thread, and what it returns: a
