@@ -35,10 +35,9 @@ Evented, later: the app passes a different `io` and handlers don't change.
 - Never `io.async` from the loop. When Threaded is out of threads, `async`
   runs the task on the caller (`Threaded.zig`, `fn async`): the loop. Only
   `concurrent` refuses instead.
-- A task that posts its answer isn't done with its `Group`. After the
-  handler returns, Threaded's worker still decrements the group's count.
-  A group freed with its request is a use-after-free, so the group belongs
-  to the router, which awaits it in `deinit`.
+- A task that posts its answer isn't done. After the handler returns,
+  Threaded's worker still touches its future, so the request can't be
+  freed on the answer's post: it waits for the reaper's await or cancel.
 - `std.Io.Reader`/`Writer` turn `error.Canceled` into `ReadFailed` and
   `WriteFailed`. Whatever cancels a handler has to remember it did, not
   read it off the handler's error, or a deadline answers 500, not 504.
@@ -50,15 +49,35 @@ Evented, later: the app passes a different `io` and handlers don't change.
 
 ## Phases
 
-1. **In:** `Scope.blocking(io)`. Its routes' handlers run as `io` tasks,
-   started with `Group.concurrent`. Their answers come back through the
-   loop's Mailbox. A refusal is 503. `ctx.io` is the scope's `io`, or
-   `std.Io.failing` on the loop, so I/O there errors instead of stalling.
-   `testing.Client` takes answers made off the loop too.
-2. Cancel a handler whose client left, and add per-route deadlines (504).
-   Each request needs a cancel handle of its own: a `Future` awaited, or
-   canceled, by a reaper task. `Group.cancel` and `Future.cancel` wait for
-   the task, so they must not run on the loop.
+1. **In:** `Scope.blocking(io)`. Its routes' handlers run as `io` tasks.
+   Their answers come back through the loop's Mailbox. A refusal is 503.
+   `ctx.io` is the scope's `io`, or `std.Io.failing` on the loop, so I/O
+   there errors instead of stalling. `testing.Client` takes answers made
+   off the loop too.
+2. **In:** a handler whose client left is canceled, and a scope's
+   `deadline` cancels one and answers 504. Each request is a `Future`
+   collected by a reaper thread per router and `Io` (`src/reaper.zig`),
+   since `Future.cancel` waits for the task. Who acts first (the handler
+   returning, the deadline, the client leaving) is one atomic state. Each
+   request owes the loop two posts: its task's `done` and the reaper's
+   `reaped`, which frees it. Left over:
+   - quic-zig's HTTP/1.1 never reports a client gone mid-exchange. In the
+     `.exchange` phase, end of input (FIN or reset alike, `onSocketEof`)
+     only clears keep-alive: it's taken as a half-close that still wants
+     its answer. But a client that leaves while it waits (a closed tab,
+     curl ^C) sends a FIN, so the fix is to read end of input there as
+     gone, as Go's net/http and nginx (499) do, with an opt-out for
+     clients that half-close on purpose. Until then `http.Server`, HTTP/1.1
+     only, never cancels for a client leaving. HTTP/3 not checked.
+   - A handler that never reaches a cancelation point holds the reaper
+     while it's canceled: other deadlines and frees wait, answers don't.
+     A reaper handing slow cancels to helper threads would fix it.
+   - The reaper is a `std.Thread`, calling `Future.cancel` from outside the
+     `Io`. Fine for Threaded. Whether zio allows that is part of phase 6.
+   - One reaper per router and `Io` means a thread started while routes
+     are registered, `Io`s matched by vtable and userdata, and `addAll`
+     rehoming routes. An app-owned `http.Blocking.init(io)` passed to
+     `blocking(&b, ...)` would drop all three. Worth it by phase 6.
 3. `before` middleware on the `io` for blocking scopes, so auth can query.
 4. `ctx.onLoop(func, args)`: run `func` on the loop and wait for it. Lets a
    blocking handler read game state without locks.

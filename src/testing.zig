@@ -20,7 +20,7 @@ const getHeader = quic.http1.parser.getHeader;
 const Address = @import("address.zig").Address;
 
 pub const Answer = struct {
-    /// Null when no route had the path.
+    /// Null when no route had the path, or the client left first (`leave`).
     status: ?u16,
     headers: []const context.Header = &.{},
     body: []const u8 = "",
@@ -35,6 +35,9 @@ pub const Options = struct {
     body: []const u8 = "",
     /// Who the connection is from: a proxy, say, with `Client.host.trusted_proxies`.
     peer: Address = .{},
+    /// The client leaves once its request is sent: a blocking handler still
+    /// running is canceled, and `request` returns once its task is collected.
+    leave: bool = false,
 };
 
 /// Answers live until `deinit`. One made off the loop (a `blocking` scope's,
@@ -94,6 +97,11 @@ pub const Client = struct {
         if (ex.passed) return .{ .status = null };
         if (ex.answer != .done and opts.body.len > 0) self.host.onHttpBody(&ex, opts.body);
         if (ex.answer != .done) self.host.onHttpEnd(&ex);
+        if (opts.leave and ex.answer != .done) {
+            self.host.onHttpGone(&ex);
+            while (back.mailbox.watching) try back.loop.run(.once);
+            return .{ .status = null };
+        }
         while (ex.answer != .done and back.mailbox.watching) try back.loop.run(.once);
         if (ex.answer != .done) return error.Unanswered;
         return .{ .status = fake.status, .headers = fake.headers.items, .body = fake.sent.items };

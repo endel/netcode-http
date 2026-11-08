@@ -180,6 +180,7 @@ const Db = struct {
     pool: ?*http.Pool = null,
     started: std.Io.Event = .unset,
     release: std.Io.Event = .unset,
+    canceled: std.atomic.Value(bool) = .init(false),
 
     fn user(db: *Db, ctx: *http.Context(.{ .params = struct { id: u32 } })) !struct { id: u32, off_loop: bool } {
         try ctx.io.sleep(.fromMilliseconds(1), .awake);
@@ -196,10 +197,13 @@ const Db = struct {
 
     fn noop() void {}
 
-    /// Holds its task until the test releases it.
+    /// Holds its task until the test releases it, or it's canceled.
     fn slow(db: *Db, ctx: *http.Context(.{})) !void {
         db.started.set(ctx.io);
-        try db.release.wait(ctx.io);
+        db.release.wait(ctx.io) catch |err| {
+            db.canceled.store(true, .release);
+            return err;
+        };
         try ctx.text(200, "done");
     }
 };
@@ -220,7 +224,7 @@ test "a blocking scope's handlers run off the loop, on its Io, and answer as any
 
     var router: http.Router = .init(gpa);
     defer router.deinit();
-    const api = try router.scope("/api").blocking(threaded.io());
+    const api = try router.scope("/api").blocking(threaded.io(), .{});
     try api.get("/users/:id", &db, Db.user);
     try api.post("/quiet", &db, Db.quiet);
     try api.get("/nested", &db, Db.nested);
@@ -236,7 +240,7 @@ test "a blocking scope's handlers run off the loop, on its Io, and answer as any
 
     // Another router's blocking routes keep running on their Io once added.
     var more: http.Router = .init(gpa);
-    try (try more.scope("").blocking(threaded.io())).get("/more/:id", &db, Db.user);
+    try (try more.scope("").blocking(threaded.io(), .{})).get("/more/:id", &db, Db.user);
     try router.scope("/v2").addAll(&more);
     more.deinit();
     try expectEqualStrings("{\"id\":3,\"off_loop\":true}", (try c.get("/v2/more/3")).body);
@@ -254,7 +258,7 @@ test "on a server: the loop answers while a blocking handler waits, and an Io wi
 
     var router: http.Router = .init(gpa);
     defer router.deinit();
-    try (try router.scope("").blocking(io)).get("/slow", &db, Db.slow);
+    try (try router.scope("").blocking(io, .{})).get("/slow", &db, Db.slow);
     try router.get("/hello", {}, hello);
     const server = try http.Server.create(gpa, &router, .{});
     defer server.destroy();
@@ -273,4 +277,40 @@ test "on a server: the loop answers while a blocking handler waits, and an Io wi
     first.join();
     try std.testing.expect(std.mem.startsWith(u8, slow_buf[0..slow_len], "HTTP/1.1 200 "));
     try expectEqualStrings("done", bodyOf(slow_buf[0..slow_len]));
+}
+
+test "a blocking handler past its scope's deadline is canceled, and the answer is 504" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db: Db = .{ .loop = std.Thread.getCurrentId() };
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    const api = try router.scope("").blocking(io, .{ .deadline = .fromMilliseconds(50) });
+    try api.get("/slow", &db, Db.slow);
+    try router.get("/hello", {}, hello);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    try expectEqual(504, (try c.get("/slow")).status.?);
+    try std.testing.expect(t0.untilNow(io).raw.toMilliseconds() < 2000);
+    try std.testing.expect(db.canceled.load(.acquire));
+    try expectEqualStrings("hello", (try c.get("/hello")).body);
+}
+
+test "a blocking handler whose client left is canceled" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db: Db = .{ .loop = std.Thread.getCurrentId() };
+
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("").blocking(threaded.io(), .{})).get("/slow", &db, Db.slow);
+    var c: http.testing.Client = .init(gpa, &router);
+    defer c.deinit();
+
+    try expectEqual(null, (try c.request(.GET, "/slow", .{ .leave = true })).status);
+    try std.testing.expect(db.canceled.load(.acquire));
 }

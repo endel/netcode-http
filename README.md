@@ -142,15 +142,15 @@ says, for a limit known at run time.
 
 ## Work that blocks
 
-A handler runs on its event loop's thread. A scope's `blocking(io)` runs its
-handlers as tasks on a `std.Io` instead, off the loop, where they may block:
-a database query, a file read. They do their I/O with `ctx.io`.
+A handler runs on its event loop's thread. A scope's `blocking(io, ...)` runs
+its handlers as tasks on a `std.Io` instead, off the loop, where they may
+block: a database query, a file read. They do their I/O with `ctx.io`.
 
 ```zig
 var threaded: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = .limited(64) });
 defer threaded.deinit(); // after the router's
 
-const api = try router.scope("/api").blocking(threaded.io());
+const api = try router.scope("/api").blocking(threaded.io(), .{ .deadline = .fromSeconds(10) });
 try api.get("/users/:id", &app, user);
 
 fn user(app: *App, ctx: *http.Context(.{ .params = struct { id: u64 } })) !User {
@@ -160,13 +160,21 @@ fn user(app: *App, ctx: *http.Context(.{ .params = struct { id: u64 } })) !User 
 
 - Each request in flight is a task until its handler returns. One the `Io`
   refuses is 503: with `std.Io.Threaded`, past its `concurrent_limit`.
+- A handler is canceled when its client leaves, or when the scope's
+  `deadline` passes, which answers 504. Its next `ctx.io` call fails with
+  `error.Canceled`, which it returns. Code that never calls into `ctx.io`
+  isn't interrupted: a 504 waits for it to return.
+- Over HTTP/1.1, quic-zig reads a client closing its connection the way it
+  reads one half-closing it, which still gets its answer. The handler there
+  runs to its end; only the deadline cuts it short.
 - A handler off the loop shares nothing with it: what the loop owns, a
   game's state say, it must not touch. `before` middleware still runs on
   the loop.
-- A handler whose client left runs to its end, and its answer is dropped.
 - On the loop, `ctx.io` is `std.Io.failing`: I/O fails there rather than
   stall the loop.
-- `router.deinit()` waits for its tasks, so the `Io` outlives the router.
+- The first blocking scope on an `Io` starts a thread that collects and
+  cancels its tasks. `router.deinit()` stops it, so the `Io` outlives the
+  router.
 
 For one piece of work rather than a whole route, a handler on the loop
 hands it to a `http.Pool`, and its result answers the request back on the
@@ -229,6 +237,9 @@ var client: http.testing.Client = .init(std.testing.allocator, &router);
 defer client.deinit();
 try std.testing.expectEqual(404, (try client.get("/scores/7")).status);
 ```
+
+With `.leave = true` the client leaves once its request is sent, which
+cancels a blocking handler still running.
 
 `http.testing.Http3` sends one request over HTTP/3 to a server in the
 test. `zig build test` runs the package's own, real quic-zig servers'

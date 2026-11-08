@@ -9,6 +9,7 @@ const std = @import("std");
 const context = @import("context.zig");
 const endpoint = @import("endpoint");
 const Middleware = @import("middleware.zig").Middleware;
+const Reaper = @import("reaper.zig").Reaper;
 const Method = context.Method;
 const Request = context.Request;
 const Response = context.Response;
@@ -104,22 +105,30 @@ pub const Found = struct {
 
     /// Answers `req` into `res`: its route's handler, an error with its
     /// status; for a method the path takes no route for, OPTIONS gets 204
-    /// and the rest 405, both with `Allow`. An error after an `offload`
-    /// leaves the answer to the work offloaded.
+    /// and the rest 405, both with `Allow`.
     pub fn run(self: *const Found, req: *const Request, res: *Response) void {
+        self.call(req, res) catch |err| failWith(req, res, err);
+    }
+
+    /// `run`, leaving a handler's error to the caller (`failWith`).
+    pub fn call(self: *const Found, req: *const Request, res: *Response) anyerror!void {
         const target = self.target orelse return Router.allow(self.node, req.method, res);
-        const call: Call = .{
+        const c: Call = .{
             .request = req,
             .response = res,
             .captures = self.captures[0..self.n],
-            .io = if (target.runs_on) |b| b.io else .failing,
+            .io = if (target.runs_on) |r| r.io else .failing,
         };
-        target.thunk(target.app, &call) catch |err| {
-            if (res.deferred) return log.err("{t} {s}: {t} after offload", .{ req.method, req.path(), err });
-            const status = context.statusOf(err);
-            if (status == 500 and !res.answered) log.err("{t} {s}: {t}", .{ req.method, req.path(), err });
-            res.fail(status);
-        };
+        return target.thunk(target.app, &c);
+    }
+
+    /// `err`'s status as the answer. One after an `offload` leaves the
+    /// answer to the work offloaded.
+    pub fn failWith(req: *const Request, res: *Response, err: anyerror) void {
+        if (res.deferred) return log.err("{t} {s}: {t} after offload", .{ req.method, req.path(), err });
+        const status = context.statusOf(err);
+        if (status == 500 and !res.answered) log.err("{t} {s}: {t}", .{ req.method, req.path(), err });
+        res.fail(status);
     }
 };
 
@@ -130,23 +139,19 @@ pub const Router = struct {
     /// What was added, in order, for `addAll`.
     entries: std.ArrayList(Entry) = .empty,
     /// One per `Io` that `blocking` scopes run on.
-    blockings: std.ArrayList(*Blocking) = .empty,
+    reapers: std.ArrayList(*Reaper) = .empty,
 
     pub const Target = struct {
         thunk: Thunk,
         app: ?*anyopaque,
         max_body: usize,
         middleware: []const Middleware = &.{},
-        /// Its handler runs as a task on this, off the loop (`Scope.blocking`).
-        runs_on: ?*Blocking = null,
-    };
-
-    /// An `Io` that handlers run on, and the group its tasks are spawned in.
-    /// The router keeps the group: a task posts its answer before it's done
-    /// with it, so it can't go with the request.
-    pub const Blocking = struct {
-        io: std.Io,
-        group: std.Io.Group = .init,
+        /// Its handler runs as a task on this one's `io`, off the loop
+        /// (`Scope.blocking`).
+        runs_on: ?*Reaper = null,
+        /// Nanoseconds a blocking handler has before it's canceled and the
+        /// answer is 504.
+        deadline_ns: ?u64 = null,
     };
     const Entry = struct { method: Method, path: []const u8, target: Target };
 
@@ -163,22 +168,24 @@ pub const Router = struct {
         return .{ .arena = .init(gpa) };
     }
 
-    /// After the servers using it have stopped. Waits for blocking handlers'
-    /// tasks to let go of their groups, so each `Io` must outlive the router.
+    /// After the servers using it have stopped, which waits for blocking
+    /// handlers' tasks. Each `Io` outlives the router.
     pub fn deinit(self: *Router) void {
-        for (self.blockings.items) |b| b.group.await(b.io) catch {};
+        for (self.reapers.items) |r| r.stop();
         self.arena.deinit();
     }
 
-    fn blockingFor(self: *Router, io: std.Io) !*Blocking {
-        for (self.blockings.items) |b| {
-            if (b.io.userdata == io.userdata and b.io.vtable == io.vtable) return b;
+    fn reaperFor(self: *Router, io: std.Io) !*Reaper {
+        for (self.reapers.items) |r| {
+            if (r.io.userdata == io.userdata and r.io.vtable == io.vtable) return r;
         }
         const a = self.arena.allocator();
-        const b = try a.create(Blocking);
-        b.* = .{ .io = io };
-        try self.blockings.append(a, b);
-        return b;
+        try self.reapers.ensureUnusedCapacity(a, 1);
+        const r = try a.create(Reaper);
+        r.* = .{ .io = io };
+        try r.start();
+        self.reapers.appendAssumeCapacity(r);
+        return r;
     }
 
     /// Routes added through this are under `prefix`, a path known at run
@@ -297,19 +304,31 @@ pub const Scope = struct {
     /// at run time (`limit`).
     max_body: ?usize = null,
     /// Where its handlers run, off the loop (`blocking`).
-    runs_on: ?*Router.Blocking = null,
+    runs_on: ?*Reaper = null,
+    deadline_ns: ?u64 = null,
+
+    pub const BlockingOptions = struct {
+        /// A handler that hasn't returned by then is canceled, and the
+        /// request answered 504. Null: none.
+        deadline: ?std.Io.Duration = null,
+    };
 
     /// Its routes' handlers run as tasks on `io`, off the event loop, so
     /// they may block: a database query, a file read. They do their I/O
     /// with `ctx.io`. `before` middleware still runs on the loop.
     ///
     /// Each request in flight is a task until its handler returns; one
-    /// `io` refuses (`std.Io.Threaded`'s `concurrent_limit`) is a 503.
-    /// The handler shares nothing with the loop: what the loop owns, a
-    /// game's state say, it must not touch. `io` outlives the router.
-    pub fn blocking(self: Scope, io: std.Io) !Scope {
+    /// `io` refuses (`std.Io.Threaded`'s `concurrent_limit`) is a 503. A
+    /// handler whose client leaves is canceled: its `io` calls fail with
+    /// `error.Canceled`, which it returns. The handler shares nothing with
+    /// the loop: what the loop owns, a game's state say, it must not touch.
+    ///
+    /// The first scope on an `io` starts a thread that collects and cancels
+    /// its tasks. `io` outlives the router.
+    pub fn blocking(self: Scope, io: std.Io, opts: BlockingOptions) !Scope {
         var s = self;
-        s.runs_on = try self.router.blockingFor(io);
+        s.runs_on = try self.router.reaperFor(io);
+        s.deadline_ns = if (opts.deadline) |d| @intCast(@max(d.nanoseconds, 0)) else null;
         return s;
     }
 
@@ -340,8 +359,9 @@ pub const Scope = struct {
             var target = e.target;
             target.middleware = try std.mem.concat(a, Middleware, &.{ self.middleware, e.target.middleware });
             if (self.max_body) |n| target.max_body = n;
-            // Rehomed: `other`'s group goes when it does.
-            if (self.runs_on orelse e.target.runs_on) |b| target.runs_on = try self.router.blockingFor(b.io);
+            // Rehomed: `other`'s reaper goes when it does.
+            if (self.runs_on orelse e.target.runs_on) |r| target.runs_on = try self.router.reaperFor(r.io);
+            if (self.runs_on != null) target.deadline_ns = self.deadline_ns;
             try self.router.insert(e.method, try std.mem.concat(a, u8, &.{ self.prefix, e.path }), target);
         }
     }
@@ -362,6 +382,7 @@ pub const Scope = struct {
             .max_body = self.max_body orelse r.max_body,
             .middleware = self.middleware,
             .runs_on = self.runs_on,
+            .deadline_ns = self.deadline_ns,
         });
     }
     pub fn get(self: Scope, comptime pattern: []const u8, app: anytype, comptime handler: anytype) !void {

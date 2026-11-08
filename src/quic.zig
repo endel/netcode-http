@@ -9,6 +9,8 @@
 const std = @import("std");
 const Exchange = @import("quic").event_loop.Exchange;
 const Mailbox = @import("quic").Mailbox;
+const reaper_mod = @import("reaper.zig");
+const Reaper = reaper_mod.Reaper;
 const context = @import("context.zig");
 const router_mod = @import("router.zig");
 const Router = router_mod.Router;
@@ -35,8 +37,18 @@ pub const Host = struct {
         found: router_mod.Found,
         body: std.ArrayList(u8) = .empty,
         content_length: ?u64,
-        /// A blocking handler's task done, back on the loop.
-        post: Mailbox.Post = .{ .run = doneOffLoop },
+        /// A blocking handler's, once it's started (`res.off_loop`).
+        off: *OffLoop = undefined,
+    };
+
+    /// A blocking handler's task, in its request's arena. It posts `done`
+    /// when the handler returns, and the reaper `task.reaped` once it's
+    /// collected, which frees the request.
+    const OffLoop = struct {
+        p: *Pending,
+        reaper: *Reaper,
+        task: reaper_mod.Task,
+        done: Mailbox.Post = .{ .run = doneOffLoop },
     };
 
     pub fn init(gpa: std.mem.Allocator, router: *const Router) Host {
@@ -82,7 +94,7 @@ pub const Host = struct {
     pub fn onHttpEnd(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
         p.req.body = p.body.items;
-        if (p.found.target.?.runs_on) |b| return spawn(p, b);
+        if (p.found.target.?.runs_on) |r| return spawn(p, r);
         p.found.run(&p.req, &p.res);
         if (!p.res.deferred) answer(p);
     }
@@ -90,30 +102,73 @@ pub const Host = struct {
     pub fn onHttpGone(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
         p.ex = null;
-        // Work still offloaded, or a task still running, frees it once it answers.
-        if (!p.res.deferred and !p.res.off_loop) release(p);
+        if (p.res.off_loop) {
+            // Still running: cancel it. Otherwise its `done` is on the way.
+            const off = p.off;
+            if (off.task.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null) off.reaper.end(&off.task);
+            return;
+        }
+        // Work still offloaded frees it once it answers.
+        if (!p.res.deferred) release(p);
     }
 
-    /// The handler as a task on `b.io`; its answer comes back through the mailbox.
-    fn spawn(p: *Pending, b: *Router.Blocking) void {
+    /// The handler as a task on `r.io`. Two posts come back: `done` when it
+    /// returns, `task.reaped` when the reaper has collected it.
+    fn spawn(p: *Pending, r: *Reaper) void {
         const late = p.res.late orelse return fail(p, 503);
-        late.mailbox.expect();
+        const deadline = p.found.target.?.deadline_ns;
+        const off = p.arena.allocator().create(OffLoop) catch return fail(p, 500);
+        off.* = .{ .p = p, .reaper = r, .task = .{
+            .mailbox = late.mailbox,
+            .reaped = .{ .run = reapedOffLoop },
+            .deadline = if (deadline) |ns| .fromNow(r.io, .{ .raw = .fromNanoseconds(ns), .clock = .awake }) else null,
+        } };
+        p.off = off;
+        late.mailbox.expect(); // done
+        late.mailbox.expect(); // task.reaped
         p.res.off_loop = true;
         // Not `io.async`: with no thread free, Threaded runs that here, on the loop.
-        b.group.concurrent(b.io, runOffLoop, .{p}) catch {
+        off.task.future = r.io.concurrent(runOffLoop, .{off}) catch {
+            late.mailbox.forget();
             late.mailbox.forget();
             p.res.off_loop = false;
             return fail(p, 503);
         };
+        if (deadline != null) r.arm(&off.task);
     }
 
-    fn runOffLoop(p: *Pending) void {
-        p.found.run(&p.req, &p.res);
-        p.res.late.?.mailbox.post(&p.post);
+    fn runOffLoop(off: *OffLoop) void {
+        const p = off.p;
+        const result = p.found.call(&p.req, &p.res);
+        // Lost to the deadline or the client: the answer is the reaper's, or nobody's.
+        if (off.task.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) == null) {
+            result catch |err| router_mod.Found.failWith(&p.req, &p.res, err);
+        }
+        p.res.late.?.mailbox.post(&off.done);
     }
 
     fn doneOffLoop(post: *Mailbox.Post) void {
-        answer(@fieldParentPtr("post", post));
+        const off: *OffLoop = @alignCast(@fieldParentPtr("done", post));
+        const p = off.p;
+        switch (off.task.state.load(.acquire)) {
+            .running => unreachable,
+            .finished => {
+                respond(p);
+                off.reaper.end(&off.task);
+            },
+            .timed_out => {
+                p.res.reset();
+                p.res.fail(504);
+                respond(p);
+            },
+            .abandoned => {},
+        }
+    }
+
+    fn reapedOffLoop(post: *Mailbox.Post) void {
+        const t: *reaper_mod.Task = @alignCast(@fieldParentPtr("reaped", post));
+        const off: *OffLoop = @alignCast(@fieldParentPtr("task", t));
+        release(off.p);
     }
 
     fn pendingOf(ex: *Exchange) ?*Pending {
@@ -130,9 +185,14 @@ pub const Host = struct {
         answer(p);
     }
 
-    /// Sends the answer, its middleware's `after` first, then frees the request.
+    /// Sends the answer, then frees the request.
     fn answer(p: *Pending) void {
-        defer release(p);
+        respond(p);
+        release(p);
+    }
+
+    /// Sends the answer, its middleware's `after` first, unless the client left.
+    fn respond(p: *Pending) void {
         const ex = p.ex orelse return;
         ex.user_data = null;
         const res = &p.res;

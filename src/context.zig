@@ -68,6 +68,12 @@ pub const Response = struct {
         return .{ .arena = arena };
     }
 
+    /// Unanswered again, its headers dropped: for an answer that replaces
+    /// whatever was built so far.
+    pub fn reset(self: *Response) void {
+        self.* = .{ .arena = self.arena, .late = self.late };
+    }
+
     /// Adds a header to the answer. One that isn't a valid field is
     /// refused: a line break in it would let it add headers of its own.
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) !void {
@@ -213,7 +219,7 @@ fn Offload(comptime func: anytype) type {
             };
             if (@TypeOf(value) == Reply) {
                 for (value.headers) |h| res.setHeader(h.name, h.value) catch {
-                    res.headers.clearRetainingCapacity();
+                    res.reset();
                     return res.fail(500);
                 };
                 return res.send(value.status, value.content_type, value.body) catch res.fail(500);
