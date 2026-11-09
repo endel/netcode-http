@@ -70,5 +70,6 @@ test {
     _ = @import("tests/router_test.zig");
     _ = @import("tests/e2e_test.zig");
     _ = @import("tests/server_test.zig");
+    _ = @import("tests/blocking_test.zig");
     _ = middleware;
 }

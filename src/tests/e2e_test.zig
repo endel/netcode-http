@@ -7,6 +7,7 @@ const sys = quic.sys;
 const event_loop = quic.event_loop;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
+const bodyOf = @import("support.zig").bodyOf;
 
 const cert_path = "../quic-zig/interop/browser/certs/server.crt";
 const key_path = "../quic-zig/interop/browser/certs/server.key";
@@ -108,11 +109,6 @@ const Harness = struct {
         return buf[0..len];
     }
 };
-
-fn bodyOf(response: []const u8) []const u8 {
-    const end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
-    return response[end + 4 ..];
-}
 
 fn has(response: []const u8, line: []const u8) bool {
     return std.mem.indexOf(u8, response, line) != null;
