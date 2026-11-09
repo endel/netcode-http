@@ -57,6 +57,9 @@ pub const Address = address.Address;
 pub const Middleware = middleware.Middleware;
 /// An accepted WebSocket, a `Scope.ws` route's.
 pub const WebSocket = @import("websocket.zig").WebSocket;
+/// A loop's WebSocket routes' sockets (`Host.sockets`), kept by an app
+/// embedding the `Host`, one per loop.
+pub const Sockets = @import("websocket.zig").Sockets;
 /// A request and its answer, as middleware and the handler share them.
 pub const Call = context.Call;
 /// The way on from `around` middleware.
