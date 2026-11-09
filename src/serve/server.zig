@@ -118,7 +118,8 @@ pub const Server = struct {
     }
 
     /// Any thread: stops now, unless drained already. Blocking handlers
-    /// still running are waited for.
+    /// still running are canceled, their clients gone, and waited for: one
+    /// that never reaches a cancelation point holds it until it returns.
     pub fn destroy(self: *Server) void {
         self.drain(0);
         self.stopped();

@@ -435,3 +435,22 @@ fn sumSmall(ctx: *http.Context(.{ .body = http.endpoint.BodyStream, .max_body = 
         total += n;
     }
 }
+
+test "destroy cancels a blocking handler still running, its client still waiting, then stops" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var db: Db = .{ .loop = std.Thread.getCurrentId() };
+    var router: http.Router = .init(gpa);
+    defer router.deinit();
+    try (try router.scope("").blocking(io, .{})).get("/slow", &db, Db.slow);
+    const server = try http.Server.create(gpa, &router, .{});
+
+    var buf: [1024]u8 = undefined;
+    var len: usize = 0;
+    const client = try std.Thread.spawn(.{}, fetchInto, .{ server.port(), "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n", &buf, &len });
+    defer client.join();
+    try db.started.wait(io);
+    server.destroy();
+    try std.testing.expect(db.canceled.load(.acquire));
+}
