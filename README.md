@@ -120,10 +120,10 @@ const Signup = struct {
   one way tries the next. A known path with another
   method is 405 with `Allow`, `error.MethodNotAllowed` on its way, so a
   scope's `errors` may word it; HEAD takes GET's route.
-- What no route has goes back to the server: static files, a 404. A
-  scope's `fallback(app, handler)` takes what its prefix's routes don't,
-  any method: `router.scope("/api").fallback({}, notFound)` gives an API
-  its own 404 (`return error.NotFound`) and leaves `/` to static files.
+- What no route has goes back to the server: a 404, or on HTTP/1.1 its
+  `static_dir`. A scope's `fallback(app, handler)` takes what its prefix's
+  routes don't, any method: `router.scope("/api").fallback({}, notFound)`
+  gives an API its own 404 (`return error.NotFound`).
 - A JSON body comes as `application/json` (or none): a cross-site form
   can't post one unasked. Another `Content-Type` is 415, unless the spec
   takes `.form = true` and it's a form: `application/x-www-form-urlencoded`
@@ -137,6 +137,33 @@ const Signup = struct {
 - `ctx.request.cookie(name)` reads a cookie; `ctx.setCookie(name, value,
   .{ .max_age = 3600 })` sets one, `Secure`, `HttpOnly` and `SameSite=Lax`
   unless it says otherwise, and `ctx.response.clearCookie` drops it.
+
+## Files
+
+A scope's `static(&files)` serves a directory under its prefix, over
+HTTP/1.1 and HTTP/3 alike: a `GET /*path` route like any other, so more
+specific routes win and the scope's middleware runs.
+
+```zig
+const site: http.Files = .{ .io = io, .root = "web/dist", .headers = &.{
+    .{ .name = "Cache-Control", .value = "no-cache" },
+} };
+try router.static(&site); // or router.scope("/assets").static(&assets)
+```
+
+- A directory answers with its `index.html`; one named without its slash
+  is redirected to it (301), so the page's relative links hold.
+- `..`, a backslash or NUL, and a name starting with a dot are 404, the
+  last unless `.dotfiles = true`.
+- An `ETag` from the file's size and time: `If-None-Match` gets 304. One
+  `Range` gets 206 (`If-Range` checked), past the end 416; several get the
+  whole file.
+- With `.precompressed = true`, `app.js.br` or `app.js.gz` goes in place of
+  `app.js` when it's there and the client takes that encoding.
+- The handler opens the file on the loop, with `io`; the transport sends
+  it a piece at a time as the client takes them. So not in a blocking
+  scope (`error.StaticBlocking`). A `root` that isn't a directory fails at
+  `static`.
 
 ## Endpoints, declared once
 

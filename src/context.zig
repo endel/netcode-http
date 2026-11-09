@@ -9,6 +9,7 @@ const streams = @import("stream.zig");
 const Stream = streams.Stream;
 const BodyReader = streams.BodyReader;
 const Events = streams.Events;
+const FileBody = @import("files.zig").Body;
 
 const endpoint = @import("endpoint");
 pub const Method = endpoint.Method;
@@ -69,6 +70,8 @@ pub const Response = struct {
     answered: bool = false,
     /// Its head went as a stream's (`Context.stream`): the rest of it did, or will.
     streamed: bool = false,
+    /// The body, read from a file as it's sent (`sendFile`), in place of `body`.
+    file: ?*FileBody = null,
 
     pub fn init(arena: std.mem.Allocator) Response {
         return .{ .arena = arena };
@@ -161,6 +164,23 @@ pub const Response = struct {
             return err;
         };
         self.sendOwned(r.status, r.content_type, r.body);
+    }
+
+    /// `body`'s bytes as the answer, read by the transport as the client
+    /// takes them, from a handler on the loop (`http.Files`). It closes the file.
+    pub fn sendFile(self: *Response, status: u16, content_type: []const u8, body: *FileBody) void {
+        if (self.answered) return body.close();
+        self.answer(status, content_type, "");
+        self.file = body;
+    }
+
+    /// `status` with no body and no Content-Type: a 304, a redirect.
+    pub fn empty(self: *Response, status: u16) void {
+        if (self.answered) return;
+        self.status = status;
+        self.content_type = null;
+        self.body = "";
+        self.answered = true;
     }
 
     /// `status` as a problem (RFC 9457) with no more to say than its title.

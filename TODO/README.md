@@ -71,7 +71,7 @@ of the `Pending`'s own before its arena, whose allocations are atomic in
 Zig 0.17. A few hundredths of a µs each at most: measure before keeping
 any.
 
-Static files, compression, request IDs, logs and metrics, HTTP/2,
+Compression, request IDs, logs and metrics, HTTP/2,
 `web-app.md`, the zio spike (`blocking.md` phase 6), handlers as fibers on
 the loop (phase 7).
 

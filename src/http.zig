@@ -38,6 +38,8 @@ pub const Method = context.Method;
 pub const Header = context.Header;
 
 pub const Reply = context.Reply;
+/// A directory's files, served by a route (`Scope.static`).
+pub const Files = @import("files.zig").Files;
 
 const stream = @import("stream.zig");
 /// A blocking handler's answer as it's made (`Context.stream`).
@@ -83,5 +85,6 @@ test {
     _ = @import("tests/e2e_test.zig");
     _ = @import("tests/server_test.zig");
     _ = @import("tests/blocking_test.zig");
+    _ = @import("tests/files_test.zig");
     _ = middleware;
 }

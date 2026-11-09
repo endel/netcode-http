@@ -70,6 +70,8 @@ pub const Host = struct {
     /// From here quic-zig's HTTP/1.1 and HTTP/3 alike owe `onHttpWritable`:
     /// their own marks, copied (TODO/streaming.md).
     const writable_mark = 64 * 1024;
+    /// What a file's answer reads at a time.
+    const file_chunk = 16 * 1024;
 
     /// A blocking handler's task, in its request's arena. It posts `done`
     /// when the handler returns, and the reaper `task.reaped` once it's
@@ -203,9 +205,11 @@ pub const Host = struct {
         answer(p);
     }
 
-    /// What a blocking handler's stream wrote has been read: it may write more.
+    /// What was written has been read: a file's answer, or a blocking
+    /// handler's stream, may write more.
     pub fn onHttpWritable(_: *Host, ex: *Exchange) void {
         const p = pendingOf(ex) orelse return;
+        if (p.call.response.file != null) return pump(p);
         giveRoom(p, false);
     }
 
@@ -367,9 +371,48 @@ pub const Host = struct {
         answer(p);
     }
 
-    /// Sends the answer, then frees the request.
+    /// Sends the answer, then frees the request; a file's once it's all out.
     fn answer(p: *Pending) void {
+        if (p.call.response.file != null and p.ex != null) return sendFile(p);
         respond(p);
+        release(p);
+    }
+
+    fn sendFile(p: *Pending) void {
+        const ex = p.ex.?;
+        const res = &p.call.response;
+        var one: [1]context.Header = undefined;
+        const headers = headOf(p, &one) catch {
+            ex.user_data = null;
+            ex.abort();
+            return release(p);
+        };
+        ex.sendHead(res.status, headers, res.file.?.len) catch {
+            ex.user_data = null;
+            return release(p);
+        };
+        pump(p);
+    }
+
+    /// A file's next pieces, while the client keeps up: `onHttpWritable`
+    /// brings it back for the rest.
+    fn pump(p: *Pending) void {
+        const ex = p.ex.?;
+        const f = p.call.response.file.?;
+        var buf: [file_chunk]u8 = undefined;
+        while (f.len > 0 and ex.answer == .body and ex.bufferedAmount() < writable_mark) {
+            const n = f.file.readPositional(f.io, &.{buf[0..@min(buf.len, f.len)]}, f.offset) catch 0;
+            if (n == 0) {
+                ex.abort(); // shrank or failed: its length went out already, so cut it off
+                break;
+            }
+            ex.write(buf[0..n]) catch break;
+            f.offset += n;
+            f.len -= n;
+        }
+        if (f.len > 0 and ex.answer == .body) return;
+        ex.user_data = null;
+        ex.finish();
         release(p);
     }
 
@@ -409,6 +452,7 @@ pub const Host = struct {
     /// Only once nothing holds it: a blocking handler's task is reaped first.
     fn release(p: *Pending) void {
         if (p.call.body) |reader| reader.deinit();
+        if (p.call.response.file) |f| f.close();
         if (p.pool) |pool| if (pool.keep(p)) return;
         p.destroy();
     }

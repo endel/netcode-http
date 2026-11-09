@@ -11,6 +11,7 @@ const endpoint = @import("endpoint");
 const Middleware = @import("middleware.zig").Middleware;
 const Reaper = @import("serve/reaper.zig").Reaper;
 const websocket = @import("websocket.zig");
+const Files = @import("files.zig").Files;
 const Method = context.Method;
 const Request = context.Request;
 const Response = context.Response;
@@ -316,6 +317,10 @@ pub const Router = struct {
     pub fn ws(self: *Router, comptime pattern: []const u8, app: anytype, comptime H: type) !void {
         return self.scope("").ws(pattern, app, H);
     }
+    /// `Scope.static` at the root.
+    pub fn static(self: *Router, files: *const Files) !void {
+        return self.scope("").static(files);
+    }
     /// `Scope.fallback` for every path: the transport's static files and 404 never come.
     pub fn fallback(self: *Router, app: anytype, comptime handler: anytype) !void {
         return self.scope("").fallback(app, handler);
@@ -575,6 +580,17 @@ pub const Scope = struct {
         var target = self.targetFor(pattern, app, H.open);
         target.ws_hooks = websocket.Hooks.of(comptime route(pattern, H.open).App, H);
         return self.router.insert(null, try std.mem.concat(self.router.arena.allocator(), u8, &.{ self.prefix, pattern }), target);
+    }
+
+    /// `files`' directory under the scope's prefix, GET and HEAD: a route
+    /// `/*path` like any other, so more specific ones win, its middleware
+    /// runs, and it answers over HTTP/1.1 and HTTP/3. Files are read on the
+    /// loop, so not in a blocking scope (`error.StaticBlocking`); a `root`
+    /// that isn't a directory fails here.
+    pub fn static(self: Scope, files: *const Files) !void {
+        if (self.runs_on != null) return error.StaticBlocking;
+        try files.check();
+        return self.on(.GET, "/*path", files, Files.serve);
     }
 
     /// What a path under the scope's prefix that no route has leads to, any

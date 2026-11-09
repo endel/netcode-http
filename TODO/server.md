@@ -34,18 +34,16 @@ time for requests in flight before stopping.
 
 ## Static files
 
-quic-zig serves `static_dir` on HTTP/1.1 only. A request passed on over
-HTTP/3 is a 404. Its `serveStatic` (`quic-zig/src/http1/conn.zig`) has:
+**In:** `Scope.static(&files)` (README, Files): over HTTP/1.1 and HTTP/3,
+ETag and 304, one Range, precompressed `.br` and `.gz`, headers of the
+app's choosing, under any prefix. Left over:
 
-- No ETag, Last-Modified or 304.
-- No Range, which video and resumed downloads need.
-- No Cache-Control, no precompressed `.gz` or `.br`, no sendfile.
-- No mount under a route prefix next to the API.
-- `Access-Control-Allow-Origin: *`, COOP and COEP on every file. Right for
-  the WebTransport demos, surprising for a general server.
-
-Either the router grows static routes, `router.static("/assets", dir)`, or
-quic-zig's static path grows these, and serves them over HTTP/3.
+- No Last-Modified or If-Modified-Since: the ETag covers what browsers send.
+- No sendfile: each piece is read into a buffer and copied out.
+- Files are opened and read on the loop, as most servers do. A cold disk
+  or a network filesystem stalls the loop meanwhile.
+- quic-zig's `static_dir` is still there, HTTP/1.1 only, for apps not on
+  this router.
 
 ## HTTP/2
 

@@ -186,6 +186,8 @@ pub const Http3 = struct {
     body: ?[]const u8 = null,
     status: [3]u8 = .{ 0, 0, 0 },
     answer: [1024]u8 = undefined,
+    /// Where the answer goes in place of `answer`: a bigger one.
+    into: ?[]u8 = null,
     len: usize = 0,
     done: bool = false,
 
@@ -208,7 +210,7 @@ pub const Http3 = struct {
     }
 
     pub fn text(self: *const Http3) []const u8 {
-        return self.answer[0..self.len];
+        return if (self.into) |b| b[0..self.len] else self.answer[0..self.len];
     }
 
     pub fn onConnected(self: *Http3, session: *quic.event_loop.ClientSession) void {
@@ -223,8 +225,9 @@ pub const Http3 = struct {
         for (headers) |h| if (std.mem.eql(u8, h.name, ":status")) @memcpy(&self.status, h.value[0..3]);
     }
     pub fn onData(self: *Http3, session: *quic.event_loop.ClientSession, _: u64, _: usize) void {
+        const out: []u8 = self.into orelse &self.answer;
         while (true) {
-            const n = session.recvBody(self.answer[self.len..]);
+            const n = session.recvBody(out[self.len..]);
             if (n == 0) break;
             self.len += n;
         }
