@@ -229,7 +229,9 @@ try admin.get("/stats", app, stats);
 - `http.Bearer`: `Authorization: Bearer <token>`, or 401.
 - `http.Cors`: listed origins read the answers, others get 403, and
   preflights are answered. A known path answers OPTIONS with `Allow`.
-- `http.RateLimit`: a token bucket per client address, or 429.
+- `http.RateLimit`: a token bucket per client, or 429. An IPv6 client is
+  its `/64` (`ip6_prefix`); past `max_clients` busy at once, a new one is
+  turned away rather than everyone's bucket starting over.
 - `http.access_log`: a line per answer, the client's address first.
 
 Behind a proxy such as routez, list it in `trusted_proxies` (the `Host`'s,
