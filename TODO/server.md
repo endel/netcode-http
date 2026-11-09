@@ -22,9 +22,18 @@ are done. Left over:
 
 ## Timeouts
 
-quic-zig's HTTP/1.1 has a handshake and a keep-alive timeout. Nothing
-bounds a slow body, a slow header, or a handler that never answers. The
-handler deadline belongs with cancellation (`blocking.md`, phase 2).
+**In:** quic-zig bounds an HTTP/1.1 head (`handshake_timeout_ms`, then
+`keepalive_timeout_ms`), holds a body still arriving to `min_body_rate`
+over each `stall_timeout_ms` on HTTP/1.1 and HTTP/3, and cuts off a file
+or a streamed answer its client leaves unread that long. A blocking
+scope's `deadline` bounds its handlers. Left over:
+
+- A handler on the loop that never answers holds its request until the
+  client leaves.
+- An HTTP/3 HEADERS frame trickled in holds a QUIC stream, up to the
+  connection's stream limit.
+- An answer read slowly but steadily is never cut off: answers have no
+  rate floor, as `websocket.min_receive_rate` gives WebSocket output.
 
 ## Graceful shutdown
 

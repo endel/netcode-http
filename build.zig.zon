@@ -4,8 +4,8 @@
     .fingerprint = 0x97780db217f6274d,
     .dependencies = .{
         .quic = .{
-            .url = "git+https://github.com/endel/quic-zig#8c027b7b0534f97ac7f75eda2cb7f4cd4ec3c6cc",
-            .hash = "quic-0.6.0-TPyrNLayNgCqcXS6_hEPikYfcD9dMtcmQFCYRUIcpJ_I",
+            .url = "git+https://github.com/endel/quic-zig#820efb8c18d94e42f30c4195f7b3e1c6486f2b44",
+            .hash = "quic-0.6.0-TPyrNPzgNgA8emkJMi8FXwCCxd0NXHH0in_ugyRzmE3k",
         },
     },
     .minimum_zig_version = "0.17.1",
