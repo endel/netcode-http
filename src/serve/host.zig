@@ -15,6 +15,8 @@ const Mailbox = @import("quic").Mailbox;
 const reaper_mod = @import("reaper.zig");
 const Reaper = reaper_mod.Reaper;
 const context = @import("../context.zig");
+const Stream = @import("../stream.zig").Stream;
+const BodyReader = @import("../stream.zig").BodyReader;
 const router_mod = @import("../router.zig");
 const Router = router_mod.Router;
 const address = @import("../address.zig");
@@ -79,7 +81,7 @@ pub const Host = struct {
         done: Mailbox.Post = .{ .run = doneOffLoop },
         /// The handler returned an error: a stream it started is cut off.
         failed: bool = false,
-        stream: context.Stream,
+        stream: Stream,
     };
 
     pub fn init(gpa: std.mem.Allocator, router: *const Router) Host {
@@ -167,7 +169,7 @@ pub const Host = struct {
         };
         if ((ex.content_length orelse 0) > target.max_body) return fail(p, 413);
         if (target.streams_body) {
-            const reader = a.create(context.BodyReader) catch return fail(p, 500);
+            const reader = a.create(BodyReader) catch return fail(p, 500);
             reader.* = .{ .io = target.runs_on.?.io };
             p.call.body = reader;
             return spawn(p, target.runs_on.?);
@@ -305,7 +307,7 @@ pub const Host = struct {
 
     /// A stream's trip: its head the first time, then its pieces, on the loop.
     fn streamOnLoop(post: *Mailbox.Post) void {
-        const s: *context.Stream = @alignCast(@fieldParentPtr("post", post));
+        const s: *Stream = @alignCast(@fieldParentPtr("post", post));
         const p: *Pending = @alignCast(@fieldParentPtr("call", s.call));
         defer s.taken.set(p.call.io);
         pour(p, s) catch {
@@ -314,7 +316,7 @@ pub const Host = struct {
         if (!s.closed and p.ex.?.bufferedAmount() >= writable_mark) s.room_owed = true else s.room.set(p.call.io);
     }
 
-    fn pour(p: *Pending, s: *context.Stream) !void {
+    fn pour(p: *Pending, s: *Stream) !void {
         const ex = p.ex orelse return error.Closed;
         const res = &p.call.response;
         if (!res.streamed) {
