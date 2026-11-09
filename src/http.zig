@@ -38,6 +38,15 @@ pub const Method = context.Method;
 pub const Header = context.Header;
 
 pub const Reply = context.Reply;
+
+const stream = @import("stream.zig");
+/// A blocking handler's answer as it's made (`Context.stream`).
+pub const Stream = stream.Stream;
+/// Server-sent events over a `Stream` (`Context.events`).
+pub const Events = stream.Events;
+/// A body as it arrives (`endpoint.BodyStream`): a blocking handler's `ctx.body`.
+pub const BodyReader = stream.BodyReader;
+
 /// The JSON answers are written in, for a body built by hand (`Reply`).
 pub const json = @import("json.zig");
 
