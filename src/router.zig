@@ -357,7 +357,7 @@ pub const Router = struct {
     /// Where a WebSocket upgrade to `req`'s path leads; null when no route takes one.
     pub fn findUpgrade(self: *const Router, req: *const Request) ?Found {
         var found = self.lookup(true, req) orelse return null;
-        found.target = found.node.ws.?;
+        found.target = found.node.ws orelse return null;
         return found;
     }
 
@@ -405,7 +405,7 @@ pub const Router = struct {
             if (upgrade) {
                 if (node.ws != null) return node;
             } else for (node.targets.values) |t| if (t != null) return node;
-            return catchAll(node, segs, found);
+            return catchAll(upgrade, node, segs, found);
         };
         for (node.statics.items) |c| if (std.mem.eql(u8, c.segment, seg)) {
             if (match(upgrade, c.node, rest, found)) |f| return f;
@@ -416,12 +416,14 @@ pub const Router = struct {
             if (match(upgrade, p, rest, found)) |f| return f;
             found.n -= 1;
         };
-        return catchAll(node, segs, found);
+        return catchAll(upgrade, node, segs, found);
     }
 
-    /// `node`'s catch-all, which takes `segs` on, empty or not.
-    fn catchAll(node: *const Node, segs: std.mem.TokenIterator(u8, .scalar), found: *Found) ?*const Node {
+    /// `node`'s catch-all, which takes `segs` on, empty or not; for an
+    /// upgrade, only one that takes WebSockets.
+    fn catchAll(comptime upgrade: bool, node: *const Node, segs: std.mem.TokenIterator(u8, .scalar), found: *Found) ?*const Node {
         const r = node.rest orelse return null;
+        if (upgrade and r.ws == null) return null;
         if (found.n == max_params) return null;
         found.captures[found.n] = spanOf(segs.buffer, segs.rest());
         found.n += 1;

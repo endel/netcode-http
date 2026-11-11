@@ -487,3 +487,20 @@ test "a WebSocket route is found for an upgrade only, and comes along with addAl
     try std.testing.expect(r.findUpgrade(&upgrade) != null);
     try std.testing.expectEqual(null, r.find(&upgrade)); // no method's route
 }
+
+test "an upgrade under a catch-all that takes no WebSockets finds no route" {
+    var r: http.Router = .init(std.testing.allocator);
+    defer r.deinit();
+    try r.get("/*path", {}, struct {
+        fn f(_: *http.Context(.{ .params = struct { path: []const u8 } })) ![]const u8 {
+            return "page";
+        }
+    }.f);
+    try r.ws("/chat", {}, Echo);
+
+    const upgrade: http.Request = .{ .method = .GET, .target = "/rooms/abc" };
+    try std.testing.expectEqual(null, r.findUpgrade(&upgrade));
+    try std.testing.expect(r.find(&upgrade) != null); // the page still is
+    const chat: http.Request = .{ .method = .GET, .target = "/chat" };
+    try std.testing.expect(r.findUpgrade(&chat) != null);
+}
